@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import logging
 from typing import List, Dict, Any
 
@@ -11,6 +12,14 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 DEBUG_DIR = "logs"
+
+# Densidade máxima tolerada de marcadores "(cid:" na camada textual.
+# Acima disso, a fonte do PDF não tem mapa Unicode confiável e o texto
+# extraído é considerado lixo — a extração deve cair para OCR.
+CID_RATIO_THRESHOLD = 0.005
+
+# Caminho padrão do Tesseract no Windows (instalador UB-Mannheim via winget)
+TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
@@ -37,19 +46,60 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
         logger.warning(f"Falha ao salvar debug de extração: {e}")
 
 
+def _pages_readable(pages_text: List[str]) -> bool:
+    """
+    Verifica se a camada textual extraída é confiável.
+
+    PDFs gerados com fontes sem mapa ToUnicode devolvem texto embaralhado,
+    cheio de marcadores "(cid:N)". Se a densidade desses marcadores passar
+    do limite, consideramos o texto inútil para parsing e exigimos OCR.
+    """
+    total = "".join(pages_text or [])
+    if not total.strip():
+        return False
+
+    cid_count = total.count("(cid:")
+    if cid_count == 0:
+        return True
+
+    ratio = cid_count / max(1, len(total))
+    if ratio >= CID_RATIO_THRESHOLD:
+        logger.warning(
+            f"Camada textual não confiável: {cid_count} marcadores (cid:) "
+            f"(densidade {ratio:.4f} >= limite {CID_RATIO_THRESHOLD})."
+        )
+        return False
+    return True
+
+
+def _ensure_tesseract_cmd() -> None:
+    """
+    Garante que o pytesseract encontra o binário no Windows,
+    mesmo que o instalador não tenha registrado o Tesseract no PATH
+    da sessão atual.
+    """
+    try:
+        import pytesseract
+
+        if shutil.which("tesseract") is None and os.path.exists(TESSERACT_WINDOWS_PATH):
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_WINDOWS_PATH
+            logger.info(f"Apontando pytesseract para {TESSERACT_WINDOWS_PATH}")
+    except Exception as e:
+        logger.warning(f"Não foi possível ajustar o caminho do Tesseract: {e}")
+
+
 def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     """
-    Extrai o texto de um PDF utilizando uma estratégia de fallback em camadas:
-    1. pdfplumber (ideal para PDFs nativos com tabelas)
-    2. PyMuPDF (fitz) como fallback rápido
-    3. OCR (pytesseract) como último recurso para PDFs escaneados
+    Extrai o texto de um PDF com fallback em camadas e gate de legibilidade:
+    1. pdfplumber  (PDFs nativos com camada textual íntegra)
+    2. PyMuPDF     (fallback rápido, mesmo gate de legibilidade)
+    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode — cids)
 
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO/UploadedFile) do Streamlit.
 
     Returns:
-        Lista de strings, onde cada elemento representa o texto de uma página.
-        Retorna lista vazia se nenhuma extração for bem-sucedida.
+        Lista de strings, uma por página. Lista vazia se nada funcionar.
     """
     source_name = getattr(file_obj, "name", "desconhecido.pdf")
     file_obj.seek(0)
@@ -58,19 +108,18 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     # Camada 1: pdfplumber
     try:
         with pdfplumber.open(file_obj) as pdf:
-            # getattr seguro: versões antigas/novas do pdfplumber podem não
-            # expor o atributo de criptografia da mesma forma
             if getattr(pdf, "is_encrypted", False):
                 logger.warning("PDF protegido por senha detectado.")
                 return []
 
             for page in pdf.pages:
-                text = page.extract_text() or ""
-                pages_text.append(text)
+                pages_text.append(page.extract_text() or "")
 
-        if any(text.strip() for text in pages_text):
+        if _pages_readable(pages_text):
             _dump_debug_text(source_name, pages_text, "pdfplumber")
             return pages_text
+
+        logger.warning("pdfplumber retornou texto corrompido (cids); tentando PyMuPDF.")
 
     except Exception as e:
         logger.warning(f"Falha na extração via pdfplumber: {e}")
@@ -85,20 +134,25 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
 
             pages_text = [page.get_text("text") for page in doc]
 
-        if any(text.strip() for text in pages_text):
+        if _pages_readable(pages_text):
             _dump_debug_text(source_name, pages_text, "pymupdf")
             return pages_text
+
+        logger.warning("PyMuPDF retornou texto corrompido (cids); partindo para OCR.")
 
     except Exception as e:
         logger.warning(f"Falha na extração via PyMuPDF: {e}")
 
-    # Camada 3: OCR (pytesseract) — último recurso, página por página
+    # Camada 3: OCR (pytesseract) — lê os glifos renderizados,
+    # contornando fontes sem mapa Unicode e PDFs escaneados.
     try:
         import pytesseract
 
+        _ensure_tesseract_cmd()
+
         file_obj.seek(0)
+        pages_text = []
         with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
-            pages_text = []
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
                 # DPI 200: equilíbrio entre qualidade de OCR e uso de memória

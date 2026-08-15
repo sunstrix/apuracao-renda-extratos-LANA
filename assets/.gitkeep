@@ -1,0 +1,34 @@
+# Script para gerar o logo placeholder
+# Salve este código como generate_logo.py na raiz do projeto e execute:
+# python generate_logo.py
+
+from PIL import Image, ImageDraw, ImageFont
+
+def generate_logo():
+    # Cria uma imagem 200x200 com fundo azul corporativo
+    img = Image.new("RGB", (200, 200), color=(30, 58, 138))
+    draw = ImageDraw.Draw(img)
+    
+    # Tenta usar a fonte Arial, se não estiver disponível, usa a padrão
+    try:
+        font = ImageFont.truetype("arial.ttf", 40)
+    except IOError:
+        font = ImageFont.load_default()
+    
+    # Desenha o texto no centro
+    text = "LANA"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    
+    x = (200 - text_width) / 2
+    y = (200 - text_height) / 2
+    
+    draw.text((x, y), text, font=font, fill=(255, 255, 255))
+    
+    # Salva na pasta assets
+    img.save("assets/logo.png")
+    print("Logo gerado com sucesso em assets/logo.png")
+
+if __name__ == "__main__":
+    generate_logo()

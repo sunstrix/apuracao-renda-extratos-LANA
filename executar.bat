@@ -10,6 +10,13 @@ if not exist "%LOG_DIR%\.gitignore" (
     echo ^!.gitignore >> "%LOG_DIR%\.gitignore"
 )
 
+REM Cria arquivo de credenciais do Streamlit para pular a tela de e-mail na primeira execucao
+if not exist ".streamlit" mkdir ".streamlit"
+if not exist ".streamlit\credentials.toml" (
+    echo [general] > ".streamlit\credentials.toml"
+    echo email = "" >> ".streamlit\credentials.toml"
+)
+
 for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss" 2^>nul`) do set "TS=%%a"
 if not defined TS set "TS=run"
 set "LOG_FILE=%LOG_DIR%\run_%TS%.log"
@@ -76,7 +83,13 @@ set NO_COLOR=1
 set PYTHONUNBUFFERED=1
 
 echo Executando Streamlit... >> "%LOG_FILE%"
-python -m streamlit run app.py --logger.level=info >> "%LOG_FILE%" 2>&1
+echo O navegador sera aberto automaticamente em http://localhost:8501
+echo.
+
+REM Abre o navegador em segundo plano apos 3 segundos
+start "" cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:8501"
+
+python -m streamlit run app.py --server.headless true --logger.level=info >> "%LOG_FILE%" 2>&1
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo =============================================== >> "%LOG_FILE%"

@@ -21,64 +21,44 @@ echo =============================================== >> "%LOG_FILE%"
 echo Instalacao iniciada.
 echo Log: %LOG_FILE%
 
-where winget >nul 2>nul
-if errorlevel 1 (
-    echo [AVISO] winget nao encontrado. >> "%LOG_FILE%"
-    echo [AVISO] winget nao encontrado.
-    goto CHECK_PYTHON
-)
-
-where python >nul 2>nul
-if errorlevel 1 (
-    echo Python nao encontrado. Tentando instalar Python via winget... >> "%LOG_FILE%"
-    echo Python nao encontrado. Tentando instalar Python via winget...
-    winget install --id Python.Python.3.11 -e --silent --accept-source-agreements --accept-package-agreements >> "%LOG_FILE%" 2>&1
-    if errorlevel 1 (
-        echo [ERRO] Falha ao instalar Python. >> "%LOG_FILE%"
-        echo [ERRO] Falha ao instalar Python.
-        goto FAIL
+REM Limpa venv antiga com Python 3.14 para evitar conflitos de versao
+if exist ".venv\pyvenv.cfg" (
+    findstr /C:"version = 3.14" .venv\pyvenv.cfg >nul
+    if not errorlevel 1 (
+        echo Detectada venv antiga com Python 3.14. Removendo para usar Python 3.11... >> "%LOG_FILE%"
+        echo Detectada venv antiga com Python 3.14. Removendo para usar Python 3.11...
+        rmdir /s /q .venv >> "%LOG_FILE%" 2>&1
     )
-    echo Python instalado. Se o script nao detectar Python agora, feche esta janela e execute instalar.bat novamente. >> "%LOG_FILE%"
-    echo Python instalado. Se o script nao detectar Python agora, feche esta janela e execute instalar.bat novamente.
-) else (
-    echo Python ja esta instalado. >> "%LOG_FILE%"
-    echo Python ja esta instalado.
 )
 
-:CHECK_PYTHON
+REM Tenta encontrar Python 3.11 ou 3.12 (que possuem binarios prontos para PyMuPDF)
 set "PYTHON_CMD="
 
-where py >nul 2>nul
+py -3.11 --version >nul 2>&1
 if not errorlevel 1 (
-    set "PYTHON_CMD=py -3"
+    set "PYTHON_CMD=py -3.11"
     goto PYTHON_FOUND
 )
 
-where python >nul 2>nul
+py -3.12 --version >nul 2>&1
 if not errorlevel 1 (
-    set "PYTHON_CMD=python"
+    set "PYTHON_CMD=py -3.12"
     goto PYTHON_FOUND
 )
 
-if exist "%SystemRoot%\py.exe" (
-    set "PYTHON_CMD="%SystemRoot%\py.exe" -3"
-    goto PYTHON_FOUND
+echo Python 3.11 ou 3.12 nao encontrado. Tentando instalar Python 3.11 via winget... >> "%LOG_FILE%"
+echo Python 3.11 ou 3.12 nao encontrado. Tentando instalar Python 3.11 via winget...
+winget install --id Python.Python.3.11 -e --silent --accept-source-agreements --accept-package-agreements >> "%LOG_FILE%" 2>&1
+if errorlevel 1 (
+    echo [ERRO] Falha ao instalar Python 3.11. >> "%LOG_FILE%"
+    echo [ERRO] Falha ao instalar Python 3.11. Instale manualmente e rode novamente.
+    goto FAIL
 )
 
-if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" (
-    set "PYTHON_CMD="%LOCALAPPDATA%\Programs\Python\Python311\python.exe""
-    goto PYTHON_FOUND
-)
-
-if exist "%ProgramFiles%\Python311\python.exe" (
-    set "PYTHON_CMD="%ProgramFiles%\Python311\python.exe""
-    goto PYTHON_FOUND
-)
-
-echo [ERRO] Python nao encontrado apos tentativa de instalacao. >> "%LOG_FILE%"
-echo [ERRO] Python nao encontrado apos tentativa de instalacao.
-echo [ERRO] Instale Python manualmente e execute instalar.bat novamente.
-goto FAIL
+echo Python 3.11 instalado. Recarregando ambiente... >> "%LOG_FILE%"
+echo Python 3.11 instalado. Recarregando ambiente...
+set "PATH=%LOCALAPPDATA%\Programs\Python\Python311;%LOCALAPPDATA%\Programs\Python\Python311\Scripts;%PATH%"
+set "PYTHON_CMD=py -3.11"
 
 :PYTHON_FOUND
 echo Comando Python selecionado: %PYTHON_CMD% >> "%LOG_FILE%"
@@ -90,8 +70,8 @@ if errorlevel 1 (
 )
 
 if not exist ".venv\Scripts\activate.bat" (
-    echo Criando ambiente virtual... >> "%LOG_FILE%"
-    echo Criando ambiente virtual...
+    echo Criando ambiente virtual com %PYTHON_CMD%... >> "%LOG_FILE%"
+    echo Criando ambiente virtual com %PYTHON_CMD%...
     call %PYTHON_CMD% -m venv .venv >> "%LOG_FILE%" 2>&1
     if errorlevel 1 (
         echo [ERRO] Falha ao criar ambiente virtual. >> "%LOG_FILE%"
@@ -119,11 +99,6 @@ if not exist "requirements.txt" (
 echo Atualizando pip... >> "%LOG_FILE%"
 echo Atualizando pip...
 python -m pip install --upgrade pip >> "%LOG_FILE%" 2>&1
-if errorlevel 1 (
-    echo [ERRO] Falha ao atualizar pip. >> "%LOG_FILE%"
-    echo [ERRO] Falha ao atualizar pip.
-    goto FAIL
-)
 
 echo Instalando dependencias do requirements.txt... >> "%LOG_FILE%"
 echo Instalando dependencias do requirements.txt...
@@ -136,22 +111,9 @@ if errorlevel 1 (
 
 where tesseract >nul 2>nul
 if errorlevel 1 (
-    where winget >nul 2>nul
-    if not errorlevel 1 (
-        echo Tesseract OCR nao encontrado. Tentando instalar via winget... >> "%LOG_FILE%"
-        echo Tesseract OCR nao encontrado. Tentando instalar via winget...
-        winget install --id UB-Mannheim.TesseractOCR -e --silent --accept-source-agreements --accept-package-agreements >> "%LOG_FILE%" 2>&1
-        if errorlevel 1 (
-            echo [AVISO] Falha ao instalar Tesseract OCR. >> "%LOG_FILE%"
-            echo [AVISO] Falha ao instalar Tesseract OCR.
-        )
-    ) else (
-        echo [AVISO] Tesseract OCR nao encontrado e winget nao esta disponivel. >> "%LOG_FILE%"
-        echo [AVISO] Tesseract OCR nao encontrado e winget nao esta disponivel.
-    )
-) else (
-    echo Tesseract OCR ja esta instalado. >> "%LOG_FILE%"
-    echo Tesseract OCR ja esta instalado.
+    echo Tesseract OCR nao encontrado. Tentando instalar via winget... >> "%LOG_FILE%"
+    echo Tesseract OCR nao encontrado. Tentando instalar via winget...
+    winget install --id UB-Mannheim.TesseractOCR -e --silent --accept-source-agreements --accept-package-agreements >> "%LOG_FILE%" 2>&1
 )
 
 echo =============================================== >> "%LOG_FILE%"

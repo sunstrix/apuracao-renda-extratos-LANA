@@ -84,3 +84,4 @@ config/local_*.json
 # macOS / Windows clutter
 .DS_Store
 Thumbs.db
+.streamlit/credentials.toml

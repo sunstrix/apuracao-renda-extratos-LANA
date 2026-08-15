@@ -1,0 +1,20 @@
+# Interface Web
+streamlit==1.32.0
+
+# Extração e Parsing de PDFs
+pdfplumber==0.11.0
+PyMuPDF==1.24.0
+
+# Manipulação de Dados e Datas
+pandas==2.2.1
+python-dateutil==2.9.0.post0
+
+# Geração de Relatório PDF
+reportlab==4.1.0
+
+# OCR (Fallback para PDFs escaneados)
+pytesseract==0.3.10
+Pillow==10.3.0
+
+# Testes
+pytest==8.1.1

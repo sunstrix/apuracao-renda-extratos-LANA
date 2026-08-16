@@ -1,7 +1,9 @@
 import io
 import os
+import re
 import shutil
 import logging
+import unicodedata
 from typing import List, Dict, Any
 
 import pdfplumber
@@ -20,6 +22,15 @@ CID_RATIO_THRESHOLD = 0.005
 
 # Caminho padrão do Tesseract no Windows (instalador UB-Mannheim via winget)
 TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Padrões regex para validar se o texto pertence ao domínio de extratos bancários BR.
+# Usados para detectar se o texto extraído é legível ou apenas lixo (mojibake).
+RE_DATE = re.compile(r'\d{1,2}/\d{1,2}/\d{2,4}')
+RE_CURRENCY = re.compile(r'R\$\s?\d', re.IGNORECASE)
+RE_BANKING_KEYWORDS = re.compile(
+    r'\b(saldo|agencia|ag[eê]ncia|conta|banco|historico|hist[oó]rico|lan[cç]amentos|extrato)\b', 
+    re.IGNORECASE
+)
 
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
@@ -46,29 +57,91 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
         logger.warning(f"Falha ao salvar debug de extração: {e}")
 
 
+def _looks_like_garbled_text(text: str) -> bool:
+    """
+    Heurística agnóstica de biblioteca para detectar texto embaralhado (mojibake).
+    
+    POR QUE ISSO É NECESSÁRIO:
+    O PyMuPDF (fitz) NÃO emite '(cid:)' quando o PDF não tem mapa ToUnicode; 
+    ele mapeia glifos para codepoints Unicode incorretos, gerando uma cifra de 
+    substituição (ex: "8OcWSBQbYO" em vez de "Transferência"). A checagem de 
+    '(cid:' sozinha falha em detectar esse lixo silencioso.
+    
+    Esta função analisa a proporção de vogais (PT-BR tem ~40%) e a presença de 
+    padrões bancários para identificar esse lixo textual com precisão.
+    """
+    if not text or not text.strip():
+        return True
+        
+    # Normaliza para remover acentos e facilitar a contagem estatística de vogais
+    normalized = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
+    letters = [c for c in normalized.lower() if c.isalpha()]
+    
+    # Verificação de padrões de domínio (Extrato Bancário BR)
+    has_patterns = bool(
+        RE_DATE.search(text) or 
+        RE_CURRENCY.search(text) or 
+        RE_BANKING_KEYWORDS.search(text)
+    )
+    
+    if len(letters) < 20:
+        # Texto muito curto para análise estatística confiável de vogais.
+        # Se for curto e não tiver padrões de banco, consideramos suspeito.
+        if not has_patterns:
+            logger.warning(f"Heurística de garbled: texto muito curto ({len(letters)} letras) e sem padrões bancários.")
+            return True
+        return False
+
+    vowels = set('aeiou')
+    vowel_count = sum(1 for c in letters if c in vowels)
+    vowel_ratio = vowel_count / len(letters)
+    
+    # PT-BR tipicamente tem entre 35% e 45% de vogais em textos corridos. 
+    # Textos corrompidos por mapeamento de fonte costumam ter < 20% ou > 60%.
+    is_vowel_ratio_ok = 0.25 <= vowel_ratio <= 0.55
+    
+    if not is_vowel_ratio_ok:
+        if not has_patterns:
+            logger.warning(
+                f"Texto considerado corrompido (mojibake/PyMuPDF): "
+                f"proporção de vogais {vowel_ratio:.2%} fora da faixa esperada "
+                f"e ausência de padrões bancários (datas/R$/saldo)."
+            )
+            return True
+        else:
+            # Tem padrão de banco, mas vogais estranhas. Pode ser uma tabela 
+            # muito densa em números/símbolos. Aceitamos, mas logamos para auditoria.
+            logger.info(f"Proporção de vogais atípica ({vowel_ratio:.2%}), mas padrões bancários encontrados.")
+            
+    return False
+
+
 def _pages_readable(pages_text: List[str]) -> bool:
     """
     Verifica se a camada textual extraída é confiável.
-
-    PDFs gerados com fontes sem mapa ToUnicode devolvem texto embaralhado,
-    cheio de marcadores "(cid:N)". Se a densidade desses marcadores passar
-    do limite, consideramos o texto inútil para parsing e exigimos OCR.
+    Combina a checagem de '(cid:)' (pdfplumber) com heurísticas de 
+    linguagem natural e domínio (PyMuPDF) para garantir que o pipeline
+    caia para OCR quando a camada textual for inútil.
     """
-    total = "".join(pages_text or [])
-    if not total.strip():
+    total_text = "".join(pages_text or [])
+    if not total_text.strip():
         return False
 
-    cid_count = total.count("(cid:")
-    if cid_count == 0:
-        return True
+    # 1. Checagem clássica de '(cid:)' (Específica do pdfplumber)
+    cid_count = total_text.count("(cid:")
+    if cid_count > 0:
+        ratio = cid_count / max(1, len(total_text))
+        if ratio >= CID_RATIO_THRESHOLD:
+            logger.warning(
+                f"Camada textual não confiável (pdfplumber): {cid_count} marcadores (cid:) "
+                f"(densidade {ratio:.4f} >= limite {CID_RATIO_THRESHOLD})."
+            )
+            return False
 
-    ratio = cid_count / max(1, len(total))
-    if ratio >= CID_RATIO_THRESHOLD:
-        logger.warning(
-            f"Camada textual não confiável: {cid_count} marcadores (cid:) "
-            f"(densidade {ratio:.4f} >= limite {CID_RATIO_THRESHOLD})."
-        )
+    # 2. Checagem de mojibake/cifra de substituição (Agnóstica, pega o fallback do PyMuPDF)
+    if _looks_like_garbled_text(total_text):
         return False
+
     return True
 
 
@@ -93,7 +166,7 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     Extrai o texto de um PDF com fallback em camadas e gate de legibilidade:
     1. pdfplumber  (PDFs nativos com camada textual íntegra)
     2. PyMuPDF     (fallback rápido, mesmo gate de legibilidade)
-    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode — cids)
+    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode — cids/mojibake)
 
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO/UploadedFile) do Streamlit.
@@ -119,7 +192,7 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
             _dump_debug_text(source_name, pages_text, "pdfplumber")
             return pages_text
 
-        logger.warning("pdfplumber retornou texto corrompido (cids); tentando PyMuPDF.")
+        logger.warning("pdfplumber retornou texto corrompido; tentando PyMuPDF.")
 
     except Exception as e:
         logger.warning(f"Falha na extração via pdfplumber: {e}")
@@ -138,7 +211,7 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
             _dump_debug_text(source_name, pages_text, "pymupdf")
             return pages_text
 
-        logger.warning("PyMuPDF retornou texto corrompido (cids); partindo para OCR.")
+        logger.warning("PyMuPDF retornou texto corrompido (mojibake); partindo para OCR.")
 
     except Exception as e:
         logger.warning(f"Falha na extração via PyMuPDF: {e}")

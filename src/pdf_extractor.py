@@ -4,7 +4,7 @@ import re
 import shutil
 import logging
 import unicodedata
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 import pdfplumber
 import fitz  # PyMuPDF
@@ -15,22 +15,70 @@ logger = logging.getLogger(__name__)
 
 DEBUG_DIR = "logs"
 
-# Densidade máxima tolerada de marcadores "(cid:" na camada textual.
-# Acima disso, a fonte do PDF não tem mapa Unicode confiável e o texto
-# extraído é considerado lixo — a extração deve cair para OCR.
+# ---------------------------------------------------------------------------
+# GATE 1 — marcadores "(cid:" (específico do pdfplumber)
+# ---------------------------------------------------------------------------
+# Quando o pdfplumber não consegue mapear um glifo para Unicode, ele emite
+# "(cid:N)" no texto. Densidade alta desses marcadores = fonte sem CMap =
+# camada textual inútil.
 CID_RATIO_THRESHOLD = 0.005
+
+# ---------------------------------------------------------------------------
+# GATE 2 — proporção de vogais
+# ---------------------------------------------------------------------------
+# Português real tem ~40-46% de vogais entre as letras. Texto fruto de cifra
+# de substituição (fonte sem ToUnicode) ficou, nas amostras reais observadas,
+# em 20-24%. Faixa conservadora para aceitar texto como natural:
+VOWEL_RATIO_MIN = 0.30
+VOWEL_RATIO_MAX = 0.55
+
+# ---------------------------------------------------------------------------
+# GATE 3 — palavras reais do português
+# ---------------------------------------------------------------------------
+# POR QUE ESTA CHECAGEM SUBSTITUIU A ANTIGA REGEX DE DATA/R$/SALDO:
+# A heurística anterior tratava a presença de datas (dd/mm/aaaa), "R$" e
+# "saldo" como sinal POSITIVO de legibilidade. Isso causava falso positivo
+# porque, na corrupção de fonte sem ToUnicode, apenas as LETRAS são
+# embaralhadas — dígitos, "/" e "R$" sobrevivem intactos à cifra de
+# substituição. Um PDF 100% ilegível ainda contém dezenas de datas e valores
+# "corretos", enganando a checagem antiga.
+# Palavras reais do português (match exato, sem acento) são estatisticamente
+# impossíveis de surgir por acaso em texto embaralhado: este é o sinal
+# confiável de legibilidade.
+COMMON_PT_WORDS = {
+    "de", "da", "do", "das", "dos", "para", "por", "com", "sem", "nos", "nas",
+    "conta", "valor", "valores", "data", "datas", "saldo", "banco",
+    "pagamento", "pagamentos", "transferencia", "transferido", "recebido",
+    "recebidos", "enviado", "enviados", "pix", "boleto", "boletos", "cartao",
+    "compra", "compras", "debito", "credito", "extrato", "movimentacao",
+    "movimentacoes", "titular", "agencia", "documento", "referente",
+    "descricao", "lancamento", "lancamentos", "periodo", "historico",
+    "disponivel", "total", "entrada", "entradas", "saida",
+}
+
+# Calibração conservadora (documentação do raciocínio):
+# - Em texto bancário REAL, as palavras acima representam tipicamente 10-20%
+#   dos tokens alfabéticos; em texto embaralhado, ~0%.
+# - REAL_WORD_RATIO_MIN = 5%: metade do piso típico de texto real, para
+#   tolerar OCR ruim ou extratos com vocabulário atípico.
+# - MIN_REAL_WORD_HITS = 20: exige "algumas dezenas" de ocorrências absolutas,
+#   impedindo que uma página curta com 2 ou 3 acertos casuais passe no gate.
+# - MIN_ALPHA_TOKENS = 100: piso amostral; abaixo disso a razão não é
+#   estatisticamente confiável e o texto é tratado como corrompido (força o
+#   fallback para a próxima camada, que é o comportamento seguro).
+REAL_WORD_RATIO_MIN = 0.05
+MIN_REAL_WORD_HITS = 20
+MIN_ALPHA_TOKENS = 100
+
+# Tamanho mínimo de token analisado.
+# NOTA TÉCNICA (desvio consciente da sugestão de 3+): mantivemos 2+ porque os
+# artigos/preposições de 2 letras ("de", "da", "do") são os tokens MAIS
+# frequentes do português real e jamais aparecem em cifra de substituição —
+# descartá-los jogaria fora o sinal mais forte de legibilidade.
+MIN_TOKEN_LEN = 2
 
 # Caminho padrão do Tesseract no Windows (instalador UB-Mannheim via winget)
 TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-# Padrões regex para validar se o texto pertence ao domínio de extratos bancários BR.
-# Usados para detectar se o texto extraído é legível ou apenas lixo (mojibake).
-RE_DATE = re.compile(r'\d{1,2}/\d{1,2}/\d{2,4}')
-RE_CURRENCY = re.compile(r'R\$\s?\d', re.IGNORECASE)
-RE_BANKING_KEYWORDS = re.compile(
-    r'\b(saldo|agencia|ag[eê]ncia|conta|banco|historico|hist[oó]rico|lan[cç]amentos|extrato)\b', 
-    re.IGNORECASE
-)
 
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
@@ -57,108 +105,153 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
         logger.warning(f"Falha ao salvar debug de extração: {e}")
 
 
-def _looks_like_garbled_text(text: str) -> bool:
-    """
-    Heurística agnóstica de biblioteca para detectar texto embaralhado (mojibake).
-    
-    POR QUE ISSO É NECESSÁRIO:
-    O PyMuPDF (fitz) NÃO emite '(cid:)' quando o PDF não tem mapa ToUnicode; 
-    ele mapeia glifos para codepoints Unicode incorretos, gerando uma cifra de 
-    substituição (ex: "8OcWSBQbYO" em vez de "Transferência"). A checagem de 
-    '(cid:' sozinha falha em detectar esse lixo silencioso.
-    
-    Esta função analisa a proporção de vogais (PT-BR tem ~40%) e a presença de 
-    padrões bancários para identificar esse lixo textual com precisão.
-    """
-    if not text or not text.strip():
-        return True
-        
-    # Normaliza para remover acentos e facilitar a contagem estatística de vogais
-    normalized = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
-    letters = [c for c in normalized.lower() if c.isalpha()]
-    
-    # Verificação de padrões de domínio (Extrato Bancário BR)
-    has_patterns = bool(
-        RE_DATE.search(text) or 
-        RE_CURRENCY.search(text) or 
-        RE_BANKING_KEYWORDS.search(text)
-    )
-    
-    if len(letters) < 20:
-        # Texto muito curto para análise estatística confiável de vogais.
-        # Se for curto e não tiver padrões de banco, consideramos suspeito.
-        if not has_patterns:
-            logger.warning(f"Heurística de garbled: texto muito curto ({len(letters)} letras) e sem padrões bancários.")
-            return True
-        return False
+def _normalize_text(text: str) -> str:
+    """Remove acentos e baixa caixa para análise estatística uniforme."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower()
 
-    vowels = set('aeiou')
-    vowel_count = sum(1 for c in letters if c in vowels)
-    vowel_ratio = vowel_count / len(letters)
-    
-    # PT-BR tipicamente tem entre 35% e 45% de vogais em textos corridos. 
-    # Textos corrompidos por mapeamento de fonte costumam ter < 20% ou > 60%.
-    is_vowel_ratio_ok = 0.25 <= vowel_ratio <= 0.55
-    
-    if not is_vowel_ratio_ok:
-        if not has_patterns:
-            logger.warning(
-                f"Texto considerado corrompido (mojibake/PyMuPDF): "
-                f"proporção de vogais {vowel_ratio:.2%} fora da faixa esperada "
-                f"e ausência de padrões bancários (datas/R$/saldo)."
-            )
-            return True
-        else:
-            # Tem padrão de banco, mas vogais estranhas. Pode ser uma tabela 
-            # muito densa em números/símbolos. Aceitamos, mas logamos para auditoria.
-            logger.info(f"Proporção de vogais atípica ({vowel_ratio:.2%}), mas padrões bancários encontrados.")
-            
-    return False
+
+def _vowel_ratio(text: str) -> float:
+    """Proporção de vogais entre as letras do texto (0.0 a 1.0)."""
+    letters = [c for c in _normalize_text(text) if c.isalpha()]
+    if not letters:
+        return 0.0
+    vowels = sum(1 for c in letters if c in "aeiou")
+    return vowels / len(letters)
+
+
+def _real_word_stats(text: str) -> Tuple[int, int]:
+    """
+    Retorna (acertos, total): quantos tokens batem exatamente com
+    COMMON_PT_WORDS versus quantos tokens alfabéticos foram analisados.
+    """
+    tokens = [
+        t for t in re.findall(r"[a-z]+", _normalize_text(text))
+        if len(t) >= MIN_TOKEN_LEN
+    ]
+    hits = sum(1 for t in tokens if t in COMMON_PT_WORDS)
+    return hits, len(tokens)
+
+
+def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
+    """
+    Heurística agnóstica de biblioteca para detectar texto embaralhado
+    (mojibake de fonte sem ToUnicode).
+
+    Regra de decisão: o texto SÓ é aceito como legível se AMBOS os sinais
+    indicarem texto natural:
+      (a) proporção de vogais dentro da faixa esperada, E
+      (b) razão de palavras reais do português acima dos limites calibrados.
+    Se QUALQUER um dos dois falhar, o texto é considerado corrompido.
+
+    Retorna (eh_garbled, detalhe) com o detalhe indicando exatamente qual
+    sinal aprovou/reprovou, para facilitar diagnóstico futuro.
+    """
+    vowel_ratio = _vowel_ratio(text)
+    vowel_ok = VOWEL_RATIO_MIN <= vowel_ratio <= VOWEL_RATIO_MAX
+
+    hits, total = _real_word_stats(text)
+    if total < MIN_ALPHA_TOKENS:
+        words_ok = False
+        words_detail = (
+            f"palavras reais: amostra insuficiente ({total} tokens < {MIN_ALPHA_TOKENS})"
+        )
+    else:
+        ratio = hits / total
+        words_ok = (hits >= MIN_REAL_WORD_HITS) and (ratio >= REAL_WORD_RATIO_MIN)
+        words_detail = f"palavras reais {hits}/{total} ({ratio:.2%})"
+
+    if vowel_ok and words_ok:
+        return False, (
+            f"texto aceito: vogais {vowel_ratio:.2%} na faixa esperada E "
+            f"{words_detail} acima do limite"
+        )
+
+    reasons = []
+    if not vowel_ok:
+        reasons.append(
+            f"proporção de vogais {vowel_ratio:.2%} fora da faixa "
+            f"[{VOWEL_RATIO_MIN:.2f}, {VOWEL_RATIO_MAX:.2f}]"
+        )
+    if not words_ok:
+        reasons.append(f"{words_detail} abaixo do limite exigido")
+
+    return True, "texto corrompido: " + " E ".join(reasons)
 
 
 def _pages_readable(pages_text: List[str]) -> bool:
     """
-    Verifica se a camada textual extraída é confiável.
-    Combina a checagem de '(cid:)' (pdfplumber) com heurísticas de 
-    linguagem natural e domínio (PyMuPDF) para garantir que o pipeline
-    caia para OCR quando a camada textual for inútil.
+    Verifica se a camada textual extraída é confiável, combinando:
+    1. Checagem de '(cid:)' (pdfplumber);
+    2. Gate duplo vogais + palavras reais (pega o mojibake silencioso do
+       PyMuPDF, que NÃO emite '(cid:)').
     """
-    total_text = "".join(pages_text or [])
+    total_text = "\n".join(pages_text or [])
     if not total_text.strip():
         return False
 
-    # 1. Checagem clássica de '(cid:)' (Específica do pdfplumber)
+    # Gate 1: marcadores (cid:) do pdfplumber
     cid_count = total_text.count("(cid:")
     if cid_count > 0:
         ratio = cid_count / max(1, len(total_text))
         if ratio >= CID_RATIO_THRESHOLD:
             logger.warning(
-                f"Camada textual não confiável (pdfplumber): {cid_count} marcadores (cid:) "
-                f"(densidade {ratio:.4f} >= limite {CID_RATIO_THRESHOLD})."
+                "Camada textual não confiável (pdfplumber): %d marcadores (cid:) "
+                "(densidade %.4f >= limite %.3f).",
+                cid_count, ratio, CID_RATIO_THRESHOLD,
             )
             return False
 
-    # 2. Checagem de mojibake/cifra de substituição (Agnóstica, pega o fallback do PyMuPDF)
-    if _looks_like_garbled_text(total_text):
+    # Gate 2+3: vogais E palavras reais
+    garbled, detail = _looks_like_garbled_text(total_text)
+    if garbled:
+        logger.warning("Gate de legibilidade REPROVOU: %s", detail)
         return False
 
+    logger.info("Gate de legibilidade APROVOU: %s", detail)
     return True
 
 
-def _ensure_tesseract_cmd() -> None:
+def _ensure_tesseract_cmd() -> Optional[str]:
     """
-    Garante que o pytesseract encontra o binário no Windows,
-    mesmo que o instalador não tenha registrado o Tesseract no PATH
-    da sessão atual.
+    Localiza o executável do Tesseract, aponta o pytesseract para ele e
+    define TESSDATA_PREFIX explicitamente (sempre, mesmo que já exista, para
+    garantir consistência entre sessões).
+
+    Retorna o diretório tessdata resolvido, ou None se o executável não for
+    encontrado.
     """
+    exe = shutil.which("tesseract")
+    if exe is None and os.path.exists(TESSERACT_WINDOWS_PATH):
+        exe = TESSERACT_WINDOWS_PATH
+
+    if exe is None:
+        logger.error(
+            "Executável do Tesseract não encontrado no PATH nem em %s.",
+            TESSERACT_WINDOWS_PATH,
+        )
+        return None
+
     try:
         import pytesseract
-
-        if shutil.which("tesseract") is None and os.path.exists(TESSERACT_WINDOWS_PATH):
-            pytesseract.pytesseract.tesseract_cmd = TESSERACT_WINDOWS_PATH
-            logger.info(f"Apontando pytesseract para {TESSERACT_WINDOWS_PATH}")
+        pytesseract.pytesseract.tesseract_cmd = exe
     except Exception as e:
-        logger.warning(f"Não foi possível ajustar o caminho do Tesseract: {e}")
+        logger.warning("Não foi possível configurar pytesseract.tesseract_cmd: %s", e)
+
+    # tessdata normalmente é a subpasta "tessdata" ao lado do executável.
+    # Se o executável veio de um shim (ex: chocolatey), tenta o caminho padrão
+    # do instalador UB-Mannheim.
+    tessdata_dir = os.path.join(os.path.dirname(os.path.abspath(exe)), "tessdata")
+    if not os.path.isdir(tessdata_dir):
+        win_candidate = os.path.join(
+            os.path.dirname(TESSERACT_WINDOWS_PATH), "tessdata"
+        )
+        if os.path.isdir(win_candidate):
+            tessdata_dir = win_candidate
+
+    os.environ["TESSDATA_PREFIX"] = tessdata_dir
+    logger.info("TESSDATA_PREFIX definido para %s", tessdata_dir)
+    return tessdata_dir
 
 
 def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
@@ -166,13 +259,10 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     Extrai o texto de um PDF com fallback em camadas e gate de legibilidade:
     1. pdfplumber  (PDFs nativos com camada textual íntegra)
     2. PyMuPDF     (fallback rápido, mesmo gate de legibilidade)
-    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode — cids/mojibake)
+    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode)
 
-    Args:
-        file_obj: Objeto de arquivo em memória (BytesIO/UploadedFile) do Streamlit.
-
-    Returns:
-        Lista de strings, uma por página. Lista vazia se nada funcionar.
+    Contrato de retorno mantido: List[str] (uma string por página),
+    lista vazia se nada funcionar.
     """
     source_name = getattr(file_obj, "name", "desconhecido.pdf")
     file_obj.seek(0)
@@ -220,9 +310,42 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     # contornando fontes sem mapa Unicode e PDFs escaneados.
     try:
         import pytesseract
+    except ImportError:
+        logger.error("pytesseract não instalado. OCR indisponível.")
+        return []
 
-        _ensure_tesseract_cmd()
+    tessdata_dir = _ensure_tesseract_cmd()
+    if tessdata_dir is None:
+        return []
 
+    # Verificação explícita do pacote de idioma ANTES de chamar o Tesseract.
+    por_traineddata = os.path.join(tessdata_dir, "por.traineddata")
+    if os.path.exists(por_traineddata):
+        ocr_lang = "por"
+    else:
+        # Erro legível e específico (não a exceção crua): cita o caminho
+        # exato que falta e como resolver.
+        logger.error(
+            "Pacote de idioma 'Português' do Tesseract NÃO está instalado. "
+            "Arquivo esperado: %s. "
+            "Solução: baixe por.traineddata em "
+            "https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata "
+            "e copie para a pasta indicada. "
+            "ÚLTIMO RECURSO: executando OCR com lang='eng' (qualidade REDUZIDA "
+            "para texto em português — dígitos, datas e valores seguem confiáveis).",
+            por_traineddata,
+        )
+        eng_traineddata = os.path.join(tessdata_dir, "eng.traineddata")
+        if not os.path.exists(eng_traineddata):
+            logger.error(
+                "Nenhum pacote de idioma disponível em %s (nem 'por', nem 'eng'). "
+                "OCR abortado para este arquivo.",
+                tessdata_dir,
+            )
+            return []
+        ocr_lang = "eng"
+
+    try:
         file_obj.seek(0)
         pages_text = []
         with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
@@ -232,7 +355,7 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
                 pix = page.get_pixmap(dpi=200)
 
                 image = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(image, lang="por")
+                text = pytesseract.image_to_string(image, lang=ocr_lang)
                 pages_text.append(text)
 
                 # Liberação explícita de memória (crítico para evitar OOM)
@@ -240,12 +363,9 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
                 del pix
                 del image
 
-        _dump_debug_text(source_name, pages_text, "ocr")
+        _dump_debug_text(source_name, pages_text, f"ocr_{ocr_lang}")
         return pages_text
 
-    except ImportError:
-        logger.error("pytesseract não instalado. OCR indisponível.")
-        return []
     except Exception as e:
         logger.error(f"Falha crítica na extração via OCR: {e}")
         return []

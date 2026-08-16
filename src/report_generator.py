@@ -1,18 +1,26 @@
+"""
+Geração de artefatos de saída:
+- generate_report(): PDF executivo (reportlab) com células em Paragraph,
+  garantindo quebra de linha e fim do estouro da coluna de valor;
+- generate_excel(): .xlsx com 3 abas (openpyxl);
+- generate_csv(): .csv (utf-8-sig, compatível com Excel BR).
+"""
 import io
+import csv
 import logging
 from datetime import datetime
 from typing import Dict, List, Any
+from xml.sax.saxutils import escape
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 logger = logging.getLogger(__name__)
 
-# Paleta de cores corporativa
 PRIMARY_BLUE = colors.HexColor("#1E3A8A")
 LIGHT_BLUE = colors.HexColor("#DBEAFE")
 GRAY_TEXT = colors.HexColor("#374151")
@@ -21,108 +29,97 @@ WHITE = colors.white
 
 
 def format_currency(value: float) -> str:
-    """Formata valor monetário no padrão brasileiro."""
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def format_date(date_obj: datetime) -> str:
-    """Formata data no padrão brasileiro dd/mm/aaaa."""
+def format_date(date_obj) -> str:
     return date_obj.strftime("%d/%m/%Y")
 
 
+def _build_cell_styles() -> Dict[str, ParagraphStyle]:
+    """
+    Estilos de célula com word-wrap. O reportlab NÃO quebra linha de string
+    pura dentro de Table — por isso TODAS as células viram Paragraph.
+    """
+    base = getSampleStyleSheet()
+    cell = ParagraphStyle("Cell", parent=base["Normal"], fontName="Helvetica",
+                          fontSize=7.5, leading=9.5, textColor=GRAY_TEXT)
+    return {
+        "cell_l": cell,
+        "cell_c": ParagraphStyle("CellC", parent=cell, alignment=TA_CENTER),
+        "cell_r": ParagraphStyle("CellR", parent=cell, alignment=TA_RIGHT),
+        "head_l": ParagraphStyle("HeadL", parent=cell, fontName="Helvetica-Bold",
+                                 fontSize=8, textColor=WHITE, alignment=TA_LEFT),
+        "head_c": ParagraphStyle("HeadC", parent=cell, fontName="Helvetica-Bold",
+                                 fontSize=8, textColor=WHITE, alignment=TA_CENTER),
+        "head_r": ParagraphStyle("HeadR", parent=cell, fontName="Helvetica-Bold",
+                                 fontSize=8, textColor=WHITE, alignment=TA_RIGHT),
+        "tot_l": ParagraphStyle("TotL", parent=cell, fontName="Helvetica-Bold"),
+        "tot_c": ParagraphStyle("TotC", parent=cell, fontName="Helvetica-Bold",
+                                alignment=TA_CENTER),
+        "tot_r": ParagraphStyle("TotR", parent=cell, fontName="Helvetica-Bold",
+                                alignment=TA_RIGHT),
+    }
+
+
+def _zebra(style_cmds: List, nrows: int, first_data_row: int = 1):
+    """Adiciona zebra striping + bordas + padding a uma tabela."""
+    for i in range(first_data_row, nrows):
+        style_cmds.append(("BACKGROUND", (0, i), (-1, i),
+                           LIGHT_GRAY if i % 2 == 0 else WHITE))
+    style_cmds += [
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.gray),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]
+    return style_cmds
+
+
 def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: List[str]) -> io.BytesIO:
-    """
-    Gera o relatório executivo em PDF e retorna o arquivo em memória (BytesIO).
-    
-    Args:
-        metrics: Dicionário com os cálculos do income_calculator.
-        holder_name: Nome do titular.
-        institutions: Lista de instituições financeiras identificadas.
-        
-    Returns:
-        Buffer BytesIO contendo o PDF gerado.
-    """
     buffer = io.BytesIO()
-    
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=2 * cm,
-        leftMargin=2 * cm,
-        topMargin=2 * cm,
-        bottomMargin=2 * cm,
-        title="Relatório Executivo de Apuração de Renda"
+        buffer, pagesize=A4,
+        rightMargin=2 * cm, leftMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2 * cm,
+        title="Relatório Executivo de Apuração de Renda",
     )
-    
     styles = getSampleStyleSheet()
-    
-    # Estilos personalizados
-    title_style = ParagraphStyle(
-        "CustomTitle",
-        parent=styles["Heading1"],
-        fontSize=18,
-        textColor=PRIMARY_BLUE,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        fontName="Helvetica-Bold"
-    )
-    
-    subtitle_style = ParagraphStyle(
-        "CustomSubtitle",
-        parent=styles["Normal"],
-        fontSize=11,
-        textColor=GRAY_TEXT,
-        alignment=TA_CENTER,
-        spaceAfter=20
-    )
-    
-    section_title_style = ParagraphStyle(
-        "SectionTitle",
-        parent=styles["Heading2"],
-        fontSize=13,
-        textColor=PRIMARY_BLUE,
-        spaceBefore=20,
-        spaceAfter=10,
-        fontName="Helvetica-Bold"
-    )
-    
-    footer_style = ParagraphStyle(
-        "Footer",
-        parent=styles["Normal"],
-        fontSize=8,
-        textColor=colors.gray,
-        alignment=TA_CENTER
-    )
-    
+    S = _build_cell_styles()
+
+    title_style = ParagraphStyle("CustomTitle", parent=styles["Heading1"], fontSize=18,
+                                 textColor=PRIMARY_BLUE, spaceAfter=30, alignment=TA_CENTER,
+                                 fontName="Helvetica-Bold")
+    subtitle_style = ParagraphStyle("CustomSubtitle", parent=styles["Normal"], fontSize=11,
+                                    textColor=GRAY_TEXT, alignment=TA_CENTER, spaceAfter=20)
+    section_title_style = ParagraphStyle("SectionTitle", parent=styles["Heading2"], fontSize=13,
+                                         textColor=PRIMARY_BLUE, spaceBefore=20, spaceAfter=10,
+                                         fontName="Helvetica-Bold")
+    footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8,
+                                  textColor=colors.gray, alignment=TA_CENTER)
+    kpi_value_style = ParagraphStyle("kpi_val", parent=subtitle_style,
+                                     textColor=PRIMARY_BLUE, fontSize=14, alignment=TA_CENTER)
+
     story = []
-    
-    # 1. Cabeçalho
     story.append(Paragraph("Relatório Executivo de Apuração de Renda", title_style))
-    
     institutions_str = ", ".join(institutions) if institutions else "Não identificadas"
-    header_text = f"<b>Titular:</b> {holder_name or 'Não informado'}<br/>"
-    header_text += f"<b>Instituição(ões):</b> {institutions_str}<br/>"
-    header_text += f"<b>Data de Geração:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    header_text = (f"<b>Titular:</b> {escape(holder_name or 'Não informado')}<br/>"
+                   f"<b>Instituição(ões):</b> {escape(institutions_str)}<br/>"
+                   f"<b>Data de Geração:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     story.append(Paragraph(header_text, subtitle_style))
     story.append(Spacer(1, 0.5 * cm))
-    
-    # 2. Cards de KPIs (Tabela com 3 colunas)
+
+    # --- Cards de KPI ---
     kpi_data = [
-        [
-            Paragraph("<b>Total Geral Apurado</b>", subtitle_style),
-            Paragraph("<b>Média Mensal Geral</b>", subtitle_style),
-            Paragraph("<b>Média Meses Completos</b>", subtitle_style)
-        ],
-        [
-            Paragraph(f"<b>{format_currency(metrics.get('total_geral', 0))}</b>", 
-                     ParagraphStyle("kpi_val", parent=subtitle_style, textColor=PRIMARY_BLUE, fontSize=14, alignment=TA_CENTER)),
-            Paragraph(f"<b>{format_currency(metrics.get('media_mensal_geral', 0))}</b>", 
-                     ParagraphStyle("kpi_val", parent=subtitle_style, textColor=PRIMARY_BLUE, fontSize=14, alignment=TA_CENTER)),
-            Paragraph(f"<b>{format_currency(metrics.get('media_meses_completos', 0))}</b>", 
-                     ParagraphStyle("kpi_val", parent=subtitle_style, textColor=PRIMARY_BLUE, fontSize=14, alignment=TA_CENTER))
-        ]
+        [Paragraph("<b>Total Geral Apurado</b>", subtitle_style),
+         Paragraph("<b>Média Mensal Geral</b>", subtitle_style),
+         Paragraph("<b>Média Meses Completos</b>", subtitle_style)],
+        [Paragraph(f"<b>{format_currency(metrics.get('total_geral', 0))}</b>", kpi_value_style),
+         Paragraph(f"<b>{format_currency(metrics.get('media_mensal_geral', 0))}</b>", kpi_value_style),
+         Paragraph(f"<b>{format_currency(metrics.get('media_meses_completos', 0))}</b>", kpi_value_style)],
     ]
-    
     kpi_table = Table(kpi_data, colWidths=[5.5 * cm] * 3)
     kpi_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
@@ -130,129 +127,185 @@ def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: Lis
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 10),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(kpi_table)
     story.append(Spacer(1, 1 * cm))
-    
-    # 3. Resumo Consolidado por Mês
+
+    # --- Resumo Consolidado por Mês ---
     story.append(Paragraph("Resumo Consolidado por Mês", section_title_style))
-    
-    resumo_data = [["Mês/Ano", "Qtd Entradas Válidas", "Total Válido Mensal"]]
+    resumo_data = [[Paragraph("Mês/Ano", S["head_c"]),
+                    Paragraph("Qtd Entradas Válidas", S["head_c"]),
+                    Paragraph("Total Válido Mensal", S["head_r"])]]
     for item in metrics.get("resumo_mensal", []):
         resumo_data.append([
-            item["month_label"],
-            str(item["qtd_entradas_validas"]),
-            format_currency(item["total_valido"])
+            Paragraph(item["month_label"], S["cell_c"]),
+            Paragraph(str(item["qtd_entradas_validas"]), S["cell_c"]),
+            Paragraph(format_currency(item["total_valido"]), S["cell_r"]),
         ])
-    
-    # Linha de TOTAL
     resumo_data.append([
-        "TOTAL",
-        str(sum(item["qtd_entradas_validas"] for item in metrics.get("resumo_mensal", []))),
-        format_currency(metrics.get("total_geral", 0))
+        Paragraph("TOTAL", S["tot_c"]),
+        Paragraph(str(sum(i["qtd_entradas_validas"] for i in metrics.get("resumo_mensal", []))), S["tot_c"]),
+        Paragraph(format_currency(metrics.get("total_geral", 0)), S["tot_r"]),
     ])
-    
-    resumo_table = Table(resumo_data, colWidths=[5 * cm, 5 * cm, 5.5 * cm], repeatRows=1)
-    resumo_table.setStyle(TableStyle([
-        # Cabeçalho
+    resumo_table = Table(resumo_data, colWidths=[4 * cm, 6.5 * cm, 6.5 * cm], repeatRows=1)
+    resumo_table.setStyle(TableStyle(_zebra([
         ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_BLUE),
-        ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        
-        # Zebra striping
-        *[("BACKGROUND", (0, i), (-1, i), LIGHT_GRAY if i % 2 == 0 else WHITE) for i in range(1, len(resumo_data))],
-        
-        # Linha de Total em destaque
-        ("BACKGROUND", (0, -1), (-1, -1), LIGHT_BLUE),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        
-        # Bordas e padding
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.gray),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
+        ("BACKGROUND", (0, len(resumo_data) - 1), (-1, len(resumo_data) - 1), LIGHT_BLUE),
+    ], len(resumo_data))))
     story.append(resumo_table)
     story.append(Spacer(1, 1 * cm))
-    
-    # 4. Detalhamento de Entradas Válidas Consideradas
+
+    # --- Detalhamento de Entradas Válidas ---
     story.append(Paragraph("Detalhamento de Entradas Válidas Consideradas", section_title_style))
-    
     valid_txs = metrics.get("entradas_validas", [])
     if valid_txs:
-        detail_data = [["Data", "Descrição da Entrada", "Valor"]]
+        detail_data = [[Paragraph("Data", S["head_c"]),
+                        Paragraph("Descrição da Entrada", S["head_l"]),
+                        Paragraph("Valor", S["head_r"])]]
         for tx in valid_txs:
             detail_data.append([
-                format_date(tx.date),
-                tx.description,
-                format_currency(tx.amount)
+                Paragraph(format_date(tx.date), S["cell_c"]),
+                Paragraph(escape(tx.description or "-"), S["cell_l"]),
+                Paragraph(format_currency(tx.amount), S["cell_r"]),
             ])
-        
-        detail_table = Table(detail_data, colWidths=[3 * cm, 8.5 * cm, 4 * cm], repeatRows=1)
-        detail_table.setStyle(TableStyle([
+        # 17cm úteis: data 2,5 + descrição 11 + valor 3,5
+        detail_table = Table(detail_data, colWidths=[2.5 * cm, 11 * cm, 3.5 * cm], repeatRows=1)
+        detail_table.setStyle(TableStyle(_zebra([
             ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_BLUE),
-            ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("ALIGN", (0, 0), (0, -1), "CENTER"),
-            ("ALIGN", (2, 0), (2, -1), "RIGHT"),
-            *[("BACKGROUND", (0, i), (-1, i), LIGHT_GRAY if i % 2 == 0 else WHITE) for i in range(1, len(detail_data))],
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.gray),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
+        ], len(detail_data))))
         story.append(detail_table)
     else:
         story.append(Paragraph("Nenhuma entrada válida encontrada.", subtitle_style))
-    
     story.append(Spacer(1, 1 * cm))
-    
-    # 5. Tabela de Auditoria (Valores Excluídos)
+
+    # --- Tabela de Auditoria ---
     story.append(Paragraph("Tabela de Auditoria (Valores Excluídos)", section_title_style))
-    
     excluded_txs = metrics.get("entradas_excluidas", [])
     if excluded_txs:
-        audit_data = [["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"]]
+        audit_data = [[Paragraph("Data Ref.", S["head_c"]),
+                       Paragraph("Descrição Original", S["head_l"]),
+                       Paragraph("Regra de Exclusão Aplicada", S["head_l"]),
+                       Paragraph("Valor", S["head_r"])]]
         for item in excluded_txs:
             audit_data.append([
-                format_date(item["date"]),
-                item["description"],
-                item["reason"],
-                format_currency(item["amount"])
+                Paragraph(format_date(item["date"]), S["cell_c"]),
+                Paragraph(escape(item["description"] or "-"), S["cell_l"]),
+                Paragraph(escape(item["reason"] or "-"), S["cell_l"]),
+                Paragraph(format_currency(item["amount"]), S["cell_r"]),
             ])
-        
-        audit_table = Table(audit_data, colWidths=[3 * cm, 6 * cm, 4 * cm, 2.5 * cm], repeatRows=1)
-        audit_table.setStyle(TableStyle([
+        audit_table = Table(audit_data, colWidths=[2.5 * cm, 6.5 * cm, 4.5 * cm, 3.5 * cm], repeatRows=1)
+        audit_table.setStyle(TableStyle(_zebra([
             ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_BLUE),
-            ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("ALIGN", (0, 0), (0, -1), "CENTER"),
-            ("ALIGN", (3, 0), (3, -1), "RIGHT"),
-            *[("BACKGROUND", (0, i), (-1, i), LIGHT_GRAY if i % 2 == 0 else WHITE) for i in range(1, len(audit_data))],
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.gray),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
+        ], len(audit_data))))
         story.append(audit_table)
     else:
         story.append(Paragraph("Nenhum valor excluído.", subtitle_style))
-    
     story.append(Spacer(1, 2 * cm))
-    
-    # 6. Rodapé com nota metodológica
+
     footer_text = (
-        "Nota Metodológica: Este relatório consolida entradas financeiras identificadas nos extratos fornecidos, "
-        "excluindo transferências de mesma titularidade, rendimentos de investimentos e créditos de jogos/apostas, "
-        "conforme regras de negócio configuradas. A média de meses completos considera apenas períodos com mais de 20 dias de extrato."
+        "Nota Metodológica: Este relatório consolida entradas financeiras identificadas nos "
+        "extratos fornecidos, excluindo transferências de mesma titularidade, rendimentos de "
+        "investimentos e créditos de jogos/apostas, conforme regras de negócio configuradas. "
+        "A média de meses completos considera apenas períodos com mais de 20 dias de extrato."
     )
     story.append(Paragraph(footer_text, footer_style))
-    
-    # Construção do PDF
     doc.build(story)
     buffer.seek(0)
-    
     return buffer
+
+
+# ---------------------------------------------------------------------------
+# Exportação Excel / CSV
+# ---------------------------------------------------------------------------
+def _excel_header_style(ws, ncols: int):
+    from openpyxl.styles import Font, PatternFill
+    fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    for col in range(1, ncols + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = fill
+
+
+def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
+                   institutions: List[str] = None) -> bytes:
+    """Gera .xlsx com 3 abas: Resumo_Mensal, Entradas_Validas, Auditoria_Excluidos."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+
+    ws1 = wb.active
+    ws1.title = "Resumo_Mensal"
+    ws1.append(["Mês/Ano", "Qtd Entradas Válidas", "Total Válido Mensal"])
+    _excel_header_style(ws1, 3)
+    for item in metrics.get("resumo_mensal", []):
+        ws1.append([item["month_label"], item["qtd_entradas_validas"],
+                    round(item["total_valido"], 2)])
+    ws1.append(["TOTAL",
+                sum(i["qtd_entradas_validas"] for i in metrics.get("resumo_mensal", [])),
+                round(metrics.get("total_geral", 0.0), 2)])
+    ws1.append([])
+    ws1.append(["Titular", holder_name or "Não informado"])
+    ws1.append(["Instituições", ", ".join(institutions or []) or "Não identificadas"])
+    ws1.append(["Total Geral Apurado", round(metrics.get("total_geral", 0.0), 2)])
+    ws1.append(["Média Mensal Geral", round(metrics.get("media_mensal_geral", 0.0), 2)])
+    ws1.append(["Média Meses Completos", round(metrics.get("media_meses_completos", 0.0), 2)])
+    ws1.column_dimensions["A"].width = 18
+    ws1.column_dimensions["B"].width = 22
+    ws1.column_dimensions["C"].width = 22
+
+    ws2 = wb.create_sheet("Entradas_Validas")
+    ws2.append(["Data", "Descrição da Entrada", "Valor", "Banco"])
+    _excel_header_style(ws2, 4)
+    for tx in metrics.get("entradas_validas", []):
+        ws2.append([format_date(tx.date), tx.description, round(tx.amount, 2),
+                    getattr(tx, "bank", "")])
+    ws2.column_dimensions["A"].width = 12
+    ws2.column_dimensions["B"].width = 80
+    ws2.column_dimensions["C"].width = 14
+    ws2.column_dimensions["D"].width = 14
+
+    ws3 = wb.create_sheet("Auditoria_Excluidos")
+    ws3.append(["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"])
+    _excel_header_style(ws3, 4)
+    for item in metrics.get("entradas_excluidas", []):
+        ws3.append([format_date(item["date"]), item["description"], item["reason"],
+                    round(item["amount"], 2)])
+    ws3.column_dimensions["A"].width = 12
+    ws3.column_dimensions["B"].width = 80
+    ws3.column_dimensions["C"].width = 45
+    ws3.column_dimensions["D"].width = 14
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def generate_csv(metrics: Dict[str, Any]) -> bytes:
+    """Gera .csv único com as 3 seções (utf-8-sig para acentos corretos no Excel)."""
+    out = io.StringIO()
+    w = csv.writer(out, delimiter=";")
+
+    w.writerow(["RESUMO MENSAL"])
+    w.writerow(["Mês/Ano", "Qtd Entradas Válidas", "Total Válido Mensal"])
+    for item in metrics.get("resumo_mensal", []):
+        w.writerow([item["month_label"], item["qtd_entradas_validas"],
+                    f"{item['total_valido']:.2f}".replace(".", ",")])
+    w.writerow(["TOTAL",
+                sum(i["qtd_entradas_validas"] for i in metrics.get("resumo_mensal", [])),
+                f"{metrics.get('total_geral', 0.0):.2f}".replace(".", ",")])
+    w.writerow([])
+
+    w.writerow(["ENTRADAS VÁLIDAS"])
+    w.writerow(["Data", "Descrição da Entrada", "Valor", "Banco"])
+    for tx in metrics.get("entradas_validas", []):
+        w.writerow([format_date(tx.date), tx.description,
+                    f"{tx.amount:.2f}".replace(".", ","), getattr(tx, "bank", "")])
+    w.writerow([])
+
+    w.writerow(["AUDITORIA - EXCLUÍDOS"])
+    w.writerow(["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"])
+    for item in metrics.get("entradas_excluidas", []):
+        w.writerow([format_date(item["date"]), item["description"], item["reason"],
+                    f"{item['amount']:.2f}".replace(".", ",")])
+
+    return out.getvalue().encode("utf-8-sig")

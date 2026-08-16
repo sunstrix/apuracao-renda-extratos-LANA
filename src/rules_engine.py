@@ -1,22 +1,57 @@
+"""
+Motor de regras de negócio da apuração de renda.
+
+Prioridade de avaliação (da mais alta para a mais baixa):
+1. Exclusão manual pelo operador (tela de revisão) — motivo propagado;
+2. Mesma titularidade detectada pelo NOME do titular na contraparte;
+3. Lançamento de débito (valor negativo);
+4. Regras automáticas por palavras-chave (config/exclusion_keywords.json):
+   mesma titularidade, investimentos/resgates, apostas/jogos.
+
+Compatibilidade retroativa: todos os parâmetros novos são opcionais;
+chamadas antigas evaluate_transaction(tx) continuam idênticas.
+"""
 import json
 import os
 import unicodedata
 import logging
-from typing import Tuple, Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.transaction_parser import Transaction
 
 logger = logging.getLogger(__name__)
 
-# Caminho para o arquivo de configuração
 CONFIG_PATH = os.path.join("config", "exclusion_keywords.json")
 
-# Fallback caso o arquivo JSON não seja encontrado no ambiente de deploy
 DEFAULT_KEYWORDS: Dict[str, List[str]] = {
-    "same_ownership": ["mesma titularidade", "conta propria", "transferencia propria"],
-    "investments": ["rendimento", "cdb", "resgate", "aplicacao", "fundo"],
-    "gambling": ["bet", "aposta", "jogo", "loteria", "cassino", "blaze", "kto"]
+    "same_ownership": [
+        "mesma titularidade",
+        "transferencia entre contas",
+        "conta propria",
+        "transferencia propria",
+        "auto transferencia",
+        "transferencia interna",
+        "movimentacao interna",
+    ],
+    "investments": [
+        "cdb", "rendimento", "aplicacao", "resgate", "fundo", "corretora",
+        "investimento", "tesouro", "lci", "lca", "dividendos",
+        "juros capital proprio", "rendimento conta corrente",
+        "rendimento poupanca", "aplicacao financeira", "resgate financeiro",
+        "aporte investimento", "renda variavel", "acoes", "fii",
+        "criptomoeda", "binance", "mercado pago rendimento",
+        "picpay rendimento",
+    ],
+    "gambling": [
+        "bet", "aposta", "jogo", "loteria", "premio", "pix bet", "cassino",
+        "sportsbook", "blaze", "estrela bet", "kto", "superbet", "novabet",
+        "aposta esportiva", "jogo do tigrinho", "fortune tiger",
+        "cassino online", "plataforma de jogo", "pix premio", "pix sorte",
+    ],
 }
+
+# Cache simples do JSON de palavras-chave, invalidado por mtime do arquivo.
+_KEYWORDS_CACHE: Dict[str, object] = {"mtime": None, "data": None}
 
 
 def load_exclusion_keywords() -> Dict[str, List[str]]:
@@ -24,79 +59,112 @@ def load_exclusion_keywords() -> Dict[str, List[str]]:
     Carrega as palavras-chave de exclusão do arquivo JSON.
     Retorna o dicionário padrão se o arquivo não existir ou for inválido.
     """
-    if not os.path.exists(CONFIG_PATH):
-        logger.warning(f"Arquivo de configuração não encontrado em {CONFIG_PATH}. Usando fallback padrão.")
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
         return DEFAULT_KEYWORDS
+
+    if _KEYWORDS_CACHE["mtime"] == mtime and _KEYWORDS_CACHE["data"] is not None:
+        return _KEYWORDS_CACHE["data"]  # type: ignore[return-value]
 
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Garante que as chaves necessárias existam
-            return {
-                "same_ownership": data.get("same_ownership", DEFAULT_KEYWORDS["same_ownership"]),
-                "investments": data.get("investments", DEFAULT_KEYWORDS["investments"]),
-                "gambling": data.get("gambling", DEFAULT_KEYWORDS["gambling"])
-            }
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"Erro ao ler arquivo de palavras-chave: {e}. Usando fallback padrão.")
+        merged = {
+            "same_ownership": data.get("same_ownership", DEFAULT_KEYWORDS["same_ownership"]),
+            "investments": data.get("investments", DEFAULT_KEYWORDS["investments"]),
+            "gambling": data.get("gambling", DEFAULT_KEYWORDS["gambling"]),
+        }
+        _KEYWORDS_CACHE["mtime"] = mtime
+        _KEYWORDS_CACHE["data"] = merged
+        return merged
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Erro ao ler arquivo de palavras-chave: %s. Usando fallback.", e)
         return DEFAULT_KEYWORDS
 
 
 def normalize_text(text: str) -> str:
-    """
-    Normaliza texto: remove acentos e converte para minúsculas.
-    Ex: "Crédito Bet" -> "credito bet"
-    """
-    if not text:
-        return ""
-    
-    # Remove acentos
-    nfkd = unicodedata.normalize("NFD", text)
-    without_accents = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
-    
-    return without_accents.lower().strip()
+    """Remove acentos e baixa caixa para comparação semântica."""
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower().strip()
 
 
-def evaluate_transaction(transaction: Transaction) -> Tuple[bool, str]:
+def _holder_matches(holder_name: str, description: str) -> bool:
     """
-    Avalia uma transação com base nas regras de negócio.
-    
-    Retorna:
+    Verifica se o nome do titular aparece na descrição da contraparte.
+
+    Critério anti-falso-positivo:
+    - nome completo normalizado presente na descrição, OU
+    - pelo menos 2 palavras do nome (com 3+ letras cada) presentes.
+    """
+    norm_holder = normalize_text(holder_name)
+    norm_desc = normalize_text(description)
+    if not norm_holder or not norm_desc:
+        return False
+
+    if norm_holder in norm_desc:
+        return True
+
+    words = [w for w in norm_holder.split() if len(w) >= 3]
+    if len(words) < 2:
+        return False
+
+    hits = sum(1 for w in words if w in norm_desc)
+    return hits >= 2
+
+
+def evaluate_transaction(
+    transaction: Transaction,
+    holder_name: Optional[str] = None,
+    manual_exclusions: Optional[Dict[int, str]] = None,
+    transaction_index: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """
+    Avalia uma transação contra as regras de negócio.
+
+    Args:
+        transaction: Transação parseada.
+        holder_name: Nome do titular (habilita a regra de mesma titularidade
+            por contraparte). Opcional.
+        manual_exclusions: Dict {índice da transação na lista bruta: motivo}
+            preenchido pela tela de revisão. Opcional.
+        transaction_index: Posição desta transação na lista bruta, para
+            consulta em manual_exclusions. Opcional.
+
+    Returns:
         (is_excluded: bool, reason: str)
-        - is_excluded = True: A transação deve ser EXCLUÍDA da apuração de renda.
-        - is_excluded = False: A transação deve ser INCLUÍDA na apuração de renda.
-        - reason: Motivo da exclusão ou confirmação de inclusão.
     """
-    # Apenas transações com valor positivo (entradas) são avaliadas para renda.
-    # Se for um débito (valor negativo), ela é ignorada no cálculo de renda,
-    # mas aqui retornamos como "excluída" para fins de auditoria de fluxo,
-    # embora o ideal seja o calculator filtrar antes.
-    # Vamos focar nas regras de exclusão de CRÉDITOS conforme solicitado.
-    
+    # 1) Exclusão manual do operador — prioridade máxima, motivo propagado.
+    if (
+        manual_exclusions
+        and transaction_index is not None
+        and transaction_index in manual_exclusions
+    ):
+        motivo = manual_exclusions[transaction_index] or "motivo não informado"
+        return True, f"Excluída manualmente pelo usuário ({motivo})"
+
+    # 2) Mesma titularidade pelo nome do titular na contraparte.
+    if holder_name and _holder_matches(holder_name, transaction.description):
+        return True, "Transferência de mesma titularidade (nome do titular identificado na contraparte)"
+
+    # 3) Débitos nunca são renda.
     if transaction.amount < 0:
-        # Débitos não são renda. Não precisamos auditá-los como exclusão de renda,
-        # mas se o sistema chamar, marcamos como excluído com motivo claro.
         return True, "Lançamento de débito (não é entrada de renda)"
 
-    # Carrega as palavras-chave (cache simples pode ser implementado no futuro)
+    # 4) Regras automáticas por palavras-chave.
     keywords = load_exclusion_keywords()
-    normalized_description = normalize_text(transaction.description)
+    norm = normalize_text(transaction.description)
 
-    # Regra 1: Transferências de mesma titularidade
     for word in keywords.get("same_ownership", []):
-        if normalize_text(word) in normalized_description:
+        if normalize_text(word) in norm:
             return True, "Transferência de mesma titularidade"
 
-    # Regra 2: Resgates e rendimentos de aplicações financeiras
     for word in keywords.get("investments", []):
-        if normalize_text(word) in normalized_description:
+        if normalize_text(word) in norm:
             return True, "Resgate/Rendimento de aplicação financeira"
 
-    # Regra 3: Créditos de plataformas de apostas/jogos
     for word in keywords.get("gambling", []):
-        if normalize_text(word) in normalized_description:
+        if normalize_text(word) in norm:
             return True, "Crédito de aposta/jogo de azar"
 
-    # Se passou por todas as exclusões, é considerada renda válida
-    # (PIX de terceiros, transferências recebidas, demais créditos)
     return False, "Entrada válida de renda"

@@ -1,23 +1,23 @@
-# Interface Web
-streamlit==1.32.0
+# --- Interface ---
+streamlit>=1.32.0
 
-# Extração e Parsing de PDFs
-pdfplumber==0.11.0
-PyMuPDF==1.24.0
+# --- Dados ---
+pandas>=2.0.0
+python-dateutil>=2.8.2
 
-# Manipulação de Dados e Datas
-pandas==2.2.1
-python-dateutil==2.9.0.post0
+# --- Extração de PDF ---
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
 
-# Geração de Relatório PDF
-reportlab==4.1.0
+# --- Relatórios ---
+reportlab>=4.0.0
+openpyxl>=3.1.0
 
-# Exportação Excel
-openpyxl==3.1.2
+# --- Integração Gemini (fallback de extração) ---
+google-generativeai>=0.8.0
+python-dotenv>=1.0.0
 
-# OCR (Fallback para PDFs escaneados)
-pytesseract==0.3.10
-Pillow==10.3.0
-
-# Testes
-pytest==8.1.1
+# --- Testes ---
+pytest>=8.0.0

@@ -8,7 +8,8 @@ Prioridade de avaliação (da mais alta para a mais baixa):
 4. Regras automáticas por palavras-chave (config/exclusion_keywords.json).
 
 Identificador de exclusão manual: índice da transação na lista bruta
-(mesmo índice exibido/editado no st.data_editor da tela de revisão).
+(mesmo índice exibido/editado no st.data_editor da tela de revisão),
+com o motivo digitado pelo operador como valor (Dict[int, str]).
 
 Compatibilidade retroativa: todos os parâmetros novos são opcionais;
 chamadas antigas evaluate_transaction(tx) continuam idênticas.

@@ -9,11 +9,13 @@ Prioridade de avaliação (da mais alta para a mais baixa):
 
 Identificador de exclusão manual: índice da transação na lista bruta
 (mesmo índice exibido/editado no st.data_editor da tela de revisão).
+
 Compatibilidade retroativa: todos os parâmetros novos são opcionais;
 chamadas antigas evaluate_transaction(tx) continuam idênticas.
 """
 import json
 import os
+import re
 import unicodedata
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -90,16 +92,25 @@ def normalize_text(text: str) -> str:
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower().strip()
 
 
+def _holder_tokens(name: str) -> List[str]:
+    """
+    Extrai tokens significativos (3+ caracteres) do nome do titular.
+    Ex.: "Davi Herculano e Silva" -> ["davi", "herculano", "silva"].
+    """
+    return [t for t in re.split(r"[^a-z0-9]+", normalize_text(name)) if len(t) >= 3]
+
+
 def _holder_matches(holder_name: str, description: str) -> bool:
     """
     Verifica se o nome do titular aparece na descrição da contraparte.
 
-    Critério anti-falso-positivo:
+    Critério anti-falso-positivo (exigência da TAREFA 2):
     - nome completo normalizado presente na descrição, OU
-    - pelo menos 2 palavras do nome (com 3+ letras cada) presentes.
-    Ex.: titular "Davi Herculano e Silva" casa com "...Pix DAVI HERCULANO E
-    SILVA - ITAÚ..." (3 palavras), mas NÃO casa com "ELIANE HERCULANO DE
-    ANDRADE" (apenas 1 palavra em comum).
+    - pelo menos 2 tokens de 3+ letras do nome presentes como tokens
+      da descrição (casamento por token, não por substring livre).
+
+    Isso exclui "DAVI HERCULANO E SILVA" (3 acertos) mas NÃO exclui
+    "ELIANE HERCULANO DE ANDRADE" (apenas 1 acerto: "herculano").
     """
     norm_holder = normalize_text(holder_name)
     norm_desc = normalize_text(description)
@@ -109,11 +120,12 @@ def _holder_matches(holder_name: str, description: str) -> bool:
     if norm_holder in norm_desc:
         return True
 
-    words = [w for w in norm_holder.split() if len(w) >= 3]
-    if len(words) < 2:
+    holder_words = _holder_tokens(holder_name)
+    if len(holder_words) < 2:
         return False
 
-    hits = sum(1 for w in words if w in norm_desc)
+    desc_tokens = set(re.split(r"[^a-z0-9]+", norm_desc))
+    hits = sum(1 for w in holder_words if w in desc_tokens)
     return hits >= 2
 
 
@@ -131,7 +143,7 @@ def evaluate_transaction(
         holder_name: Nome do titular (habilita a regra de mesma titularidade
             por contraparte). Opcional.
         manual_exclusions: Dict {índice da transação na lista bruta: motivo}
-            preenchido pela tela de revisão. Opcional.
+            preenchido pela tela de revisão. Tem PRIORIDADE máxima. Opcional.
         transaction_index: Posição desta transação na lista bruta, para
             consulta em manual_exclusions. Opcional.
 

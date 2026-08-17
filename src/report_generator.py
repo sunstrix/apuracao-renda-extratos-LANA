@@ -1,27 +1,31 @@
 """
 Geração de artefatos de saída:
-- generate_report(): PDF executivo (reportlab) com células em Paragraph
-  (quebra de linha correta, sem estouro de coluna);
-- generate_excel(): .xlsx com 3 abas (openpyxl);
-- generate_csv(): .csv (utf-8-sig, separador ';' para Excel pt-BR).
-
+generate_report(): PDF executivo (reportlab) com células em Paragraph
+(quebra de linha correta, sem estouro de coluna);
+generate_excel(): .xlsx com 3 abas (openpyxl);
+generate_csv(): .csv (utf-8-sig, separador ';' para Excel pt-BR).
 Rastreabilidade da revisão manual (TAREFA 5):
-- lançamentos válidos confirmados manualmente pelo operador recebem o
-  marcador "*" na descrição + nota de rodapé explicativa;
-- motivos de exclusão manual chegam na coluna de motivo da auditoria
-  ("Excluída manualmente pelo usuário (motivo)"), produzidos pelo
-  rules_engine a partir do Dict[int, str] da tela de revisão.
-
+lançamentos válidos confirmados manualmente pelo operador recebem o
+marcador "*" na descrição + nota de rodapé explicativa;
+motivos de exclusão manual chegam na coluna de motivo da auditoria
+("Excluída manualmente pelo usuário (motivo)"), produzidos pelo
+rules_engine a partir do Dict[int, str] da tela de revisão.
 Compatibilidade: lê tx.manually_confirmed via getattr — transações sem o
 atributo (fluxos antigos) comportam-se como não-manuais.
+
+RODADA 2:
+- FIX F: seção/linhas de "Rastreabilidade da Revisão Manual" no PDF, Excel e
+  CSV, consumindo a chave "revisao_manual" produzida pelo income_calculator
+  (omitida automaticamente em fluxos antigos sem a chave);
+- FIX G: canário de inconsistência — entrada válida com valor negativo gera
+  logger.error nos três artefatos, sem alterar o fluxo de geração.
 """
 import io
 import csv
 import logging
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from xml.sax.saxutils import escape
-
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import cm
@@ -41,19 +45,49 @@ NOTA_CONFIRMACAO_MANUAL = (
     "* sinal de crédito/débito confirmado manualmente pelo operador"
 )
 
-
 def format_currency(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-
 def format_date(date_obj) -> str:
     return date_obj.strftime("%d/%m/%Y")
-
 
 def _is_manual(tx) -> bool:
     """True se o lançamento foi confirmado manualmente pelo operador."""
     return bool(getattr(tx, "manually_confirmed", False))
 
+def _review_summary(metrics: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """
+    FIX F (rodada 2): rastreabilidade da revisão manual.
+
+    Lê a chave "revisao_manual" produzida pelo income_calculator (FIX C).
+    Retorna (confirmadas_como_renda, excluidas_ou_pendentes), ou None se a
+    chave não existir (compatibilidade retroativa com fluxos antigos).
+    """
+    revisao = metrics.get("revisao_manual")
+    if not revisao:
+        return None
+    return (
+        len(revisao.get("incluidas", [])),
+        len(revisao.get("excluidas", [])),
+    )
+
+def _canary_negative_valid(tx) -> None:
+    """
+    FIX G (rodada 2): CANÁRIO de inconsistência de contrato.
+
+    Entrada válida com valor negativo indica regressão de parser/calculator
+    (contrato do sistema: entrada válida => amount > 0). Apenas loga o erro
+    para diagnóstico imediato, SEM alterar o fluxo de geração do artefato.
+    """
+    if tx.amount < 0:
+        logger.error(
+            "INCONSISTÊNCIA NO RELATÓRIO: entrada válida com valor negativo "
+            "(%s | %s | %.2f | %s). Regressão de parser/calculator suspeita.",
+            getattr(tx, "date", "?"),
+            tx.description,
+            tx.amount,
+            getattr(tx, "source_file", "") or "PDF",
+        )
 
 def _build_cell_styles() -> Dict[str, ParagraphStyle]:
     base = getSampleStyleSheet()
@@ -77,7 +111,6 @@ def _build_cell_styles() -> Dict[str, ParagraphStyle]:
                                textColor=GRAY_TEXT),
     }
 
-
 def _zebra(style_cmds: List, nrows: int, first_data_row: int = 1):
     for i in range(first_data_row, nrows):
         style_cmds.append(("BACKGROUND", (0, i), (-1, i),
@@ -91,7 +124,6 @@ def _zebra(style_cmds: List, nrows: int, first_data_row: int = 1):
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
     ]
     return style_cmds
-
 
 def generate_report(metrics: Dict[str, Any], holder_name: str,
                     institutions: List[str]) -> io.BytesIO:
@@ -122,6 +154,7 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
 
     story = []
     story.append(Paragraph("Relatório Executivo de Apuração de Renda", title_style))
+
     institutions_str = ", ".join(institutions) if institutions else "Não identificadas"
     header_text = (f"<b>Titular:</b> {escape(holder_name or 'Não informado')}<br/>"
                    f"<b>Instituição(ões):</b> {escape(institutions_str)}<br/>"
@@ -182,6 +215,8 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
                         Paragraph("Descrição da Entrada", S["head_l"]),
                         Paragraph("Valor", S["head_r"])]]
         for tx in valid_txs:
+            # FIX G (rodada 2): canário de entrada válida negativa.
+            _canary_negative_valid(tx)
             desc = escape(tx.description or "-")
             if _is_manual(tx):
                 desc += " *"
@@ -225,8 +260,18 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
         story.append(audit_table)
     else:
         story.append(Paragraph("Nenhum valor excluído.", subtitle_style))
-    story.append(Spacer(1, 2 * cm))
 
+    # --- FIX F (rodada 2): Rastreabilidade da Revisão Manual ---
+    review = _review_summary(metrics)
+    if review is not None:
+        story.append(Spacer(1, 0.4 * cm))
+        story.append(Paragraph(
+            f"Rastreabilidade da Revisão Manual: {review[0]} lançamento(s) confirmado(s) "
+            f"manualmente como renda • {review[1]} exclusão(ões) manuais ou pendentes de revisão.",
+            S["note"],
+        ))
+
+    story.append(Spacer(1, 2 * cm))
     footer_text = (
         "Nota Metodológica: Este relatório consolida entradas financeiras identificadas nos "
         "extratos fornecidos, excluindo transferências de mesma titularidade, rendimentos de "
@@ -235,10 +280,10 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
         "Lançamentos marcados com '*' tiveram o sinal confirmado manualmente pelo operador."
     )
     story.append(Paragraph(footer_text, footer_style))
+
     doc.build(story)
     buffer.seek(0)
     return buffer
-
 
 def _excel_header_style(ws, ncols: int):
     from openpyxl.styles import Font, PatternFill
@@ -248,11 +293,9 @@ def _excel_header_style(ws, ncols: int):
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = fill
 
-
 def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
                    institutions: List[str] = None) -> bytes:
     from openpyxl import Workbook
-
     wb = Workbook()
 
     ws1 = wb.active
@@ -271,6 +314,11 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     ws1.append(["Total Geral Apurado", round(metrics.get("total_geral", 0.0), 2)])
     ws1.append(["Média Mensal Geral", round(metrics.get("media_mensal_geral", 0.0), 2)])
     ws1.append(["Média Meses Completos", round(metrics.get("media_meses_completos", 0.0), 2)])
+    # FIX F (rodada 2): rastreabilidade da revisão manual no Excel.
+    review = _review_summary(metrics)
+    if review is not None:
+        ws1.append(["Revisão Manual (confirmados como renda)", review[0]])
+        ws1.append(["Revisão Manual (exclusões/pendentes)", review[1]])
     ws1.column_dimensions["A"].width = 18
     ws1.column_dimensions["B"].width = 22
     ws1.column_dimensions["C"].width = 22
@@ -280,6 +328,8 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     _excel_header_style(ws2, 5)
     manual_any = False
     for tx in metrics.get("entradas_validas", []):
+        # FIX G (rodada 2): canário de entrada válida negativa.
+        _canary_negative_valid(tx)
         manual = _is_manual(tx)
         manual_any = manual_any or manual
         ws2.append([format_date(tx.date), tx.description, round(tx.amount, 2),
@@ -308,11 +358,9 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     wb.save(buf)
     return buf.getvalue()
 
-
 def generate_csv(metrics: Dict[str, Any]) -> bytes:
     out = io.StringIO()
     w = csv.writer(out, delimiter=";")
-
     w.writerow(["RESUMO MENSAL"])
     w.writerow(["Mês/Ano", "Qtd Entradas Válidas", "Total Válido Mensal"])
     for item in metrics.get("resumo_mensal", []):
@@ -321,12 +369,18 @@ def generate_csv(metrics: Dict[str, Any]) -> bytes:
     w.writerow(["TOTAL",
                 sum(i["qtd_entradas_validas"] for i in metrics.get("resumo_mensal", [])),
                 f"{metrics.get('total_geral', 0.0):.2f}".replace(".", ",")])
+    # FIX F (rodada 2): rastreabilidade da revisão manual no CSV.
+    review = _review_summary(metrics)
+    if review is not None:
+        w.writerow(["REVISÃO MANUAL", "Confirmados como renda", review[0]])
+        w.writerow(["REVISÃO MANUAL", "Exclusões/pendentes", review[1]])
     w.writerow([])
-
     w.writerow(["ENTRADAS VÁLIDAS"])
     w.writerow(["Data", "Descrição da Entrada", "Valor", "Banco", "Obs."])
     manual_any = False
     for tx in metrics.get("entradas_validas", []):
+        # FIX G (rodada 2): canário de entrada válida negativa.
+        _canary_negative_valid(tx)
         manual = _is_manual(tx)
         manual_any = manual_any or manual
         w.writerow([format_date(tx.date), tx.description,
@@ -336,11 +390,9 @@ def generate_csv(metrics: Dict[str, Any]) -> bytes:
         w.writerow([])
         w.writerow([NOTA_CONFIRMACAO_MANUAL])
     w.writerow([])
-
     w.writerow(["AUDITORIA - EXCLUÍDOS"])
     w.writerow(["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"])
     for item in metrics.get("entradas_excluidas", []):
         w.writerow([format_date(item["date"]), item["description"], item["reason"],
                     f"{item['amount']:.2f}".replace(".", ",")])
-
     return out.getvalue().encode("utf-8-sig")

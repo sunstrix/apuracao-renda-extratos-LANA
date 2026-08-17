@@ -1,3 +1,13 @@
+"""
+Extração de texto de PDFs com fallback em camadas e otimizações de performance.
+
+Arquitetura:
+- Detecção inteligente de texto vs imagem (evita OCR desnecessário)
+- Prioridade: fitz (PyMuPDF) > pdfplumber > OCR
+- Gate de legibilidade para detectar texto corrompido
+- Cache com @st.cache_data para evitar reprocessamento
+- DPI adaptativo para OCR (150 → 200 se qualidade baixa)
+"""
 import io
 import os
 import re
@@ -5,10 +15,18 @@ import shutil
 import logging
 import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
+import hashlib
 
 import pdfplumber
 import fitz  # PyMuPDF
 from PIL import Image
+
+# Importação condicional do Streamlit para cache
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
 
 # Configuração de logging para diagnóstico sem poluir a interface do Streamlit
 logger = logging.getLogger(__name__)
@@ -46,14 +64,14 @@ VOWEL_RATIO_MAX = 0.55
 # impossíveis de surgir por acaso em texto embaralhado: este é o sinal
 # confiável de legibilidade.
 COMMON_PT_WORDS = {
-    "de", "da", "do", "das", "dos", "para", "por", "com", "sem", "nos", "nas",
-    "conta", "valor", "valores", "data", "datas", "saldo", "banco",
-    "pagamento", "pagamentos", "transferencia", "transferido", "recebido",
-    "recebidos", "enviado", "enviados", "pix", "boleto", "boletos", "cartao",
-    "compra", "compras", "debito", "credito", "extrato", "movimentacao",
-    "movimentacoes", "titular", "agencia", "documento", "referente",
-    "descricao", "lancamento", "lancamentos", "periodo", "historico",
-    "disponivel", "total", "entrada", "entradas", "saida",
+    "de ",  "da ",  "do ",  "das ",  "dos ",  "para ",  "por ",  "com ",  "sem ",  "nos ",  "nas ",
+    "conta ",  "valor ",  "valores ",  "data ",  "datas ",  "saldo ",  "banco ",
+    "pagamento ",  "pagamentos ",  "transferencia ",  "transferido ",  "recebido ",
+    "recebidos ",  "enviado ",  "enviados ",  "pix ",  "boleto ",  "boletos ",  "cartao ",
+    "compra ",  "compras ",  "debito ",  "credito ",  "extrato ",  "movimentacao ",
+    "movimentacoes ",  "titular ",  "agencia ",  "documento ",  "referente ",
+    "descricao ",  "lancamento ",  "lancamentos ",  "periodo ",  "historico ",
+    "disponivel ",  "total ",  "entrada ",  "entradas ",  "saida ",
 }
 
 # Calibração conservadora (documentação do raciocínio):
@@ -88,9 +106,9 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
     """
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
-        safe_name = "".join(c for c in source_name if c.isalnum() or c in "._-")
+        safe_name = "".join(c for c in source_name if c.isalnum() or c in ".-_")
         path = os.path.join(DEBUG_DIR, f"debug_extracao_{safe_name}.txt")
-
+        
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"ORIGEM DA EXTRACAO: {origin}\n")
             f.write(f"ARQUIVO: {source_name}\n")
@@ -99,7 +117,6 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
                 f.write(f"\n----- PÁGINA {idx} -----\n")
                 f.write(page if page and page.strip() else "<SEM TEXTO>")
                 f.write("\n")
-
         logger.info(f"Debug de extração salvo em {path}")
     except Exception as e:
         logger.warning(f"Falha ao salvar debug de extração: {e}")
@@ -137,19 +154,20 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
     """
     Heurística agnóstica de biblioteca para detectar texto embaralhado
     (mojibake de fonte sem ToUnicode).
-
+    
     Regra de decisão: o texto SÓ é aceito como legível se AMBOS os sinais
     indicarem texto natural:
       (a) proporção de vogais dentro da faixa esperada, E
       (b) razão de palavras reais do português acima dos limites calibrados.
+    
     Se QUALQUER um dos dois falhar, o texto é considerado corrompido.
-
+    
     Retorna (eh_garbled, detalhe) com o detalhe indicando exatamente qual
     sinal aprovou/reprovou, para facilitar diagnóstico futuro.
     """
     vowel_ratio = _vowel_ratio(text)
     vowel_ok = VOWEL_RATIO_MIN <= vowel_ratio <= VOWEL_RATIO_MAX
-
+    
     hits, total = _real_word_stats(text)
     if total < MIN_ALPHA_TOKENS:
         words_ok = False
@@ -160,13 +178,13 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
         ratio = hits / total
         words_ok = (hits >= MIN_REAL_WORD_HITS) and (ratio >= REAL_WORD_RATIO_MIN)
         words_detail = f"palavras reais {hits}/{total} ({ratio:.2%})"
-
+    
     if vowel_ok and words_ok:
         return False, (
             f"texto aceito: vogais {vowel_ratio:.2%} na faixa esperada E "
             f"{words_detail} acima do limite"
         )
-
+    
     reasons = []
     if not vowel_ok:
         reasons.append(
@@ -175,7 +193,7 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
         )
     if not words_ok:
         reasons.append(f"{words_detail} abaixo do limite exigido")
-
+    
     return True, "texto corrompido: " + " E ".join(reasons)
 
 
@@ -189,7 +207,7 @@ def _pages_readable(pages_text: List[str]) -> bool:
     total_text = "\n".join(pages_text or [])
     if not total_text.strip():
         return False
-
+    
     # Gate 1: marcadores (cid:) do pdfplumber
     cid_count = total_text.count("(cid:")
     if cid_count > 0:
@@ -201,13 +219,13 @@ def _pages_readable(pages_text: List[str]) -> bool:
                 cid_count, ratio, CID_RATIO_THRESHOLD,
             )
             return False
-
+    
     # Gate 2+3: vogais E palavras reais
     garbled, detail = _looks_like_garbled_text(total_text)
     if garbled:
         logger.warning("Gate de legibilidade REPROVOU: %s", detail)
         return False
-
+    
     logger.info("Gate de legibilidade APROVOU: %s", detail)
     return True
 
@@ -217,27 +235,27 @@ def _ensure_tesseract_cmd() -> Optional[str]:
     Localiza o executável do Tesseract, aponta o pytesseract para ele e
     define TESSDATA_PREFIX explicitamente (sempre, mesmo que já exista, para
     garantir consistência entre sessões).
-
+    
     Retorna o diretório tessdata resolvido, ou None se o executável não for
     encontrado.
     """
     exe = shutil.which("tesseract")
     if exe is None and os.path.exists(TESSERACT_WINDOWS_PATH):
         exe = TESSERACT_WINDOWS_PATH
-
+    
     if exe is None:
         logger.error(
             "Executável do Tesseract não encontrado no PATH nem em %s.",
             TESSERACT_WINDOWS_PATH,
         )
         return None
-
+    
     try:
         import pytesseract
         pytesseract.pytesseract.tesseract_cmd = exe
     except Exception as e:
         logger.warning("Não foi possível configurar pytesseract.tesseract_cmd: %s", e)
-
+    
     # tessdata normalmente é a subpasta "tessdata" ao lado do executável.
     # Se o executável veio de um shim (ex: chocolatey), tenta o caminho padrão
     # do instalador UB-Mannheim.
@@ -248,64 +266,143 @@ def _ensure_tesseract_cmd() -> Optional[str]:
         )
         if os.path.isdir(win_candidate):
             tessdata_dir = win_candidate
-
+    
     os.environ["TESSDATA_PREFIX"] = tessdata_dir
     logger.info("TESSDATA_PREFIX definido para %s", tessdata_dir)
     return tessdata_dir
 
 
-def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
+def pdf_has_text(file_bytes: bytes) -> bool:
     """
-    Extrai o texto de um PDF com fallback em camadas e gate de legibilidade:
-    1. pdfplumber  (PDFs nativos com camada textual íntegra)
-    2. PyMuPDF     (fallback rápido, mesmo gate de legibilidade)
-    3. OCR         (PDFs escaneados OU com fonte sem mapa Unicode)
-
-    Contrato de retorno mantido: List[str] (uma string por página),
-    lista vazia se nada funcionar.
+    PERF-3: Detecção rápida de texto vs imagem usando PyMuPDF.
+    
+    Verifica se o PDF possui camada de texto extraível em pelo menos uma página.
+    Esta verificação é feita ANTES de qualquer tentativa de OCR, evitando
+    processamento desnecessário em PDFs nativos.
+    
+    Args:
+        file_bytes: Conteúdo do PDF em bytes
+        
+    Returns:
+        True se o PDF tem texto extraível, False caso contrário
     """
-    source_name = getattr(file_obj, "name", "desconhecido.pdf")
-    file_obj.seek(0)
-    pages_text: List[str] = []
-
-    # Camada 1: pdfplumber
     try:
-        with pdfplumber.open(file_obj) as pdf:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            # Verifica apenas as primeiras 2 páginas para performance
+            pages_to_check = min(2, len(doc))
+            for page_num in range(pages_to_check):
+                page = doc.load_page(page_num)
+                text = page.get_text("text").strip()
+                if text and len(text) > 50:  # Threshold mínimo para considerar "tem texto"
+                    return True
+            return False
+    except Exception as e:
+        logger.warning(f"Erro ao verificar se PDF tem texto: {e}")
+        # Em caso de erro, assume que pode ter texto (conservador)
+        return True
+
+
+def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
+    """
+    PERF-4: OCR com DPI adaptativo.
+    
+    Tenta OCR com DPI 150 primeiro (mais rápido); se qualidade for baixa,
+    reprocessa com DPI 200 (mais lento, mas confiável).
+    
+    Args:
+        page: Página do PyMuPDF
+        lang: Idioma do OCR ('por' ou 'eng')
+        
+    Returns:
+        Texto extraído via OCR
+    """
+    import pytesseract
+    
+    # Tentativa 1: DPI baixo (mais rápido)
+    pix = page.get_pixmap(dpi=150)
+    image = Image.open(io.BytesIO(pix.tobytes("png")))
+    text = pytesseract.image_to_string(image, lang=lang)
+    image.close()
+    
+    # Valida qualidade usando gate de legibilidade
+    hits, total = _real_word_stats(text)
+    if total >= MIN_ALPHA_TOKENS and (hits / total) >= (REAL_WORD_RATIO_MIN * 0.8):
+        logger.info(f"OCR com DPI 150 aceitável ({hits}/{total} palavras)")
+        del pix
+        return text
+    
+    # Tentativa 2: DPI alto (mais lento, mas confiável)
+    logger.info(f"OCR com DPI 150 insuficiente; retentando com DPI 200")
+    pix = page.get_pixmap(dpi=200)
+    image = Image.open(io.BytesIO(pix.tobytes("png")))
+    text = pytesseract.image_to_string(image, lang=lang)
+    image.close()
+    del pix
+    del image
+    
+    return text
+
+
+def _compute_file_hash(file_bytes: bytes) -> str:
+    """Computa hash SHA256 do conteúdo do arquivo para cache."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str]:
+    """
+    Implementação interna da extração de texto (sem cache).
+    
+    PERF-1: Inverteu a prioridade para fitz > pdfplumber > OCR.
+    
+    Args:
+        file_bytes: Conteúdo do PDF em bytes
+        source_name: Nome do arquivo para logging
+        
+    Returns:
+        Lista de strings (uma por página)
+    """
+    pages_text: List[str] = []
+    
+    # PERF-3: Verificação rápida de texto antes de qualquer extração
+    has_text = pdf_has_text(file_bytes)
+    if not has_text:
+        logger.info(f"PDF sem camada de texto detectada. Partindo direto para OCR.")
+    
+    # Camada 1: PyMuPDF (fitz) - MAIS RÁPIDO para texto puro
+    if has_text:
+        try:
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                if doc.needs_pass:
+                    logger.warning("PDF protegido por senha detectado no PyMuPDF.")
+                    return []
+                pages_text = [page.get_text("text") for page in doc]
+            
+            if _pages_readable(pages_text):
+                _dump_debug_text(source_name, pages_text, "pymupdf")
+                logger.info(f"Extração bem-sucedida via PyMuPDF (fitz)")
+                return pages_text
+            
+            logger.warning("PyMuPDF retornou texto corrompido; tentando pdfplumber.")
+        except Exception as e:
+            logger.warning(f"Falha na extração via PyMuPDF: {e}")
+    
+    # Camada 2: pdfplumber (fallback para tabelas complexas)
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             if getattr(pdf, "is_encrypted", False):
                 logger.warning("PDF protegido por senha detectado.")
                 return []
-
-            for page in pdf.pages:
-                pages_text.append(page.extract_text() or "")
-
+            pages_text = [page.extract_text() or "" for page in pdf.pages]
+        
         if _pages_readable(pages_text):
             _dump_debug_text(source_name, pages_text, "pdfplumber")
+            logger.info(f"Extração bem-sucedida via pdfplumber")
             return pages_text
-
-        logger.warning("pdfplumber retornou texto corrompido; tentando PyMuPDF.")
-
+        
+        logger.warning("pdfplumber retornou texto corrompido; partindo para OCR.")
     except Exception as e:
         logger.warning(f"Falha na extração via pdfplumber: {e}")
-
-    # Camada 2: PyMuPDF (fitz)
-    try:
-        file_obj.seek(0)
-        with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
-            if doc.needs_pass:
-                logger.warning("PDF protegido por senha detectado no PyMuPDF.")
-                return []
-
-            pages_text = [page.get_text("text") for page in doc]
-
-        if _pages_readable(pages_text):
-            _dump_debug_text(source_name, pages_text, "pymupdf")
-            return pages_text
-
-        logger.warning("PyMuPDF retornou texto corrompido (mojibake); partindo para OCR.")
-
-    except Exception as e:
-        logger.warning(f"Falha na extração via PyMuPDF: {e}")
-
+    
     # Camada 3: OCR (pytesseract) — lê os glifos renderizados,
     # contornando fontes sem mapa Unicode e PDFs escaneados.
     try:
@@ -313,11 +410,11 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
     except ImportError:
         logger.error("pytesseract não instalado. OCR indisponível.")
         return []
-
+    
     tessdata_dir = _ensure_tesseract_cmd()
     if tessdata_dir is None:
         return []
-
+    
     # Verificação explícita do pacote de idioma ANTES de chamar o Tesseract.
     por_traineddata = os.path.join(tessdata_dir, "por.traineddata")
     if os.path.exists(por_traineddata):
@@ -344,47 +441,75 @@ def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
             )
             return []
         ocr_lang = "eng"
-
+    
     try:
-        file_obj.seek(0)
         pages_text = []
-        with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                # DPI 200: equilíbrio entre qualidade de OCR e uso de memória
-                pix = page.get_pixmap(dpi=200)
-
-                image = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(image, lang=ocr_lang)
+                # PERF-4: DPI adaptativo (150 primeiro, 200 se qualidade baixa)
+                text = _ocr_with_adaptive_dpi(page, lang=ocr_lang)
                 pages_text.append(text)
-
-                # Liberação explícita de memória (crítico para evitar OOM)
-                image.close()
-                del pix
-                del image
-
+        
         _dump_debug_text(source_name, pages_text, f"ocr_{ocr_lang}")
+        logger.info(f"Extração bem-sucedida via OCR ({ocr_lang})")
         return pages_text
-
     except Exception as e:
         logger.error(f"Falha crítica na extração via OCR: {e}")
         return []
 
 
+# PERF-2: Cache com @st.cache_data para evitar reprocessamento
+if STREAMLIT_AVAILABLE:
+    @st.cache_data
+    def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
+        """
+        Extrai o texto de um PDF com fallback em camadas e gate de legibilidade.
+        
+        PERF-1: Prioridade invertida para fitz (PyMuPDF) > pdfplumber > OCR.
+        PERF-2: Cache com @st.cache_data para evitar reprocessamento.
+        PERF-3: Detecção inteligente de texto vs imagem antes do OCR.
+        PERF-4: DPI adaptativo para OCR (150 → 200 se qualidade baixa).
+        
+        Contrato de retorno mantido: List[str] (uma string por página),
+        lista vazia se nada funcionar.
+        """
+        source_name = getattr(file_obj, "name", "desconhecido.pdf")
+        file_obj.seek(0)
+        file_bytes = file_obj.read()
+        
+        logger.info(f"Iniciando extração de texto de {source_name}")
+        return _extract_text_from_pdf_impl(file_bytes, source_name)
+else:
+    # Fallback para quando Streamlit não está disponível (ex: testes)
+    def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
+        """
+        Extrai o texto de um PDF com fallback em camadas e gate de legibilidade.
+        
+        Versão sem cache (para ambientes sem Streamlit).
+        """
+        source_name = getattr(file_obj, "name", "desconhecido.pdf")
+        file_obj.seek(0)
+        file_bytes = file_obj.read()
+        
+        logger.info(f"Iniciando extração de texto de {source_name}")
+        return _extract_text_from_pdf_impl(file_bytes, source_name)
+
+
 def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
     """
     Extrai tabelas de um PDF usando pdfplumber.
-
+    
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO).
-
+        
     Returns:
         Lista de tabelas. Cada tabela é uma lista de linhas,
         e cada linha é uma lista de strings (células).
     """
     file_obj.seek(0)
     all_tables: List[List[List[str]]] = []
-
+    
     try:
         with pdfplumber.open(file_obj) as pdf:
             for page in pdf.pages:
@@ -394,20 +519,19 @@ def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
                 except Exception as e:
                     logger.warning(f"Erro ao extrair tabela de página específica: {e}")
                     continue
-
     except Exception as e:
         logger.warning(f"Falha na extração de tabelas: {e}")
-
+    
     return all_tables
 
 
 def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
     """
     Extrai metadados básicos do PDF para auto-detecção de titular/instituição.
-
+    
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO).
-
+        
     Returns:
         Dicionário com metadados disponíveis.
     """
@@ -418,7 +542,7 @@ def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
         "subject": None,
         "pages": 0
     }
-
+    
     try:
         with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
             metadata["pages"] = len(doc)
@@ -429,5 +553,5 @@ def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
                 metadata["subject"] = meta.get("subject")
     except Exception as e:
         logger.warning(f"Falha ao extrair metadados: {e}")
-
+    
     return metadata

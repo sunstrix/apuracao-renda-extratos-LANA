@@ -1,11 +1,17 @@
 """
 Interface principal Streamlit da Apuração de Renda via Extratos PDF.
 
-Fluxo: upload -> extração (com status/progresso) -> validação visual das
-transações brutas (expander) -> regras de exclusão -> KPIs/tabelas ->
-exportação PDF / Excel / CSV. Dados cacheados em session_state.
+Fluxo (com revisão humana obrigatória antes da exportação):
+1. upload -> extração (st.status + st.progress) -> parsing por banco;
+2. expander com TODAS as transações brutas (antes das regras);
+3. tabela editável (st.data_editor) de revisão manual:
+   - Sinal Detectado (Crédito / Débito / ⚠️ Indeterminado);
+   - checkbox "Incluir na apuração" (pré-marcado só p/ créditos automáticos);
+   - coluna "Motivo da exclusão (manual)";
+4. botão "Confirmar revisão e gerar relatório" -> calculate_income_metrics()
+   recebendo manual_exclusions / manual_inclusions;
+5. downloads PDF / Excel / CSV habilitados somente após a confirmação.
 """
-import re
 import logging
 
 import streamlit as st
@@ -27,79 +33,86 @@ def brl(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-# Linha que parece nome próprio: 2+ palavras puramente alfabéticas
-_NAME_LINE_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ]+)+")
-# Palavras que desqualificam uma linha como nome de pessoa
-_NOT_NAME_RE = re.compile(
-    r"(CPF|CNPJ|Agência|Agencia|Conta|Banco|^NU$|Movimenta|Saldo|Extrato|http|"
-    r"Tem alguma|Caso a solução|Ouvidoria|Atendimento|CNPJ:)",
-    re.IGNORECASE,
-)
-
-
 def try_detect_holder_name(text_pages) -> str:
     """
-    Detecta o nome do titular em extratos Nubank/OCR.
-
-    Estratégia principal: a linha imediatamente ACIMA da linha que contém
-    "CPF" é o nome do titular no layout real do extrato, desde que essa
-    linha pareça um nome próprio (2-6 palavras, sem dígitos).
+    Detecta o titular no extrato (Nubank/OCR): a linha imediatamente acima
+    da linha que contém "CPF" é o nome do titular.
     """
     lines = []
     for page in (text_pages or [])[:4]:
         lines.extend((page or "").splitlines())
 
     for idx, line in enumerate(lines):
-        if not re.search(r"\bCPF\b", line, re.IGNORECASE):
+        if "CPF" not in line:
             continue
-
-        # Procura a linha não-vazia anterior
         j = idx - 1
         while j >= 0 and not lines[j].strip():
             j -= 1
         if j < 0:
             continue
-
-        cand = lines[j].strip()
-        cand = cand.replace("nll", "").strip()  # ruído comum de OCR
-
+        cand = lines[j].strip().replace("nll", "").replace("nU", "").strip()
         if (
             2 <= len(cand.split()) <= 6
-            and not re.search(r"\d", cand)
-            and not _NOT_NAME_RE.search(cand)
-            and _NAME_LINE_RE.fullmatch(cand)
+            and not any(ch.isdigit() for ch in cand)
+            and not any(k in cand.upper() for k in
+                        ("CPF", "CNPJ", "AGÊNCIA", "AGENCIA", "CONTA", "BANCO",
+                         "MOVIMENTA", "SALDO", "EXTRATO", "NU ", "VALORES"))
+            and all(w[0].isalpha() for w in cand.split() if w)
         ):
-            logger.info("Titular detectado: %s", cand)
             return cand
-
-    # Fallback: rótulos explícitos (extratos de outros bancos)
-    text = "\n".join(lines)
-    for pattern in (
-        r"Titular:\s*([A-Za-zÀ-ÖØ-öø-ÿ][^\n]{4,60})",
-        r"Nome:\s*([A-Za-zÀ-ÖØ-öø-ÿ][^\n]{4,60})",
-        r"Cliente:\s*([A-Za-zÀ-ÖØ-öø-ÿ][^\n]{4,60})",
-    ):
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip().title()
-
     return ""
+
+
+def build_review_dataframe(raw) -> pd.DataFrame:
+    """
+    Monta a tabela de revisão manual.
+    Pré-marca "Incluir" apenas para créditos automáticos
+    (needs_review=False e is_credit=True). Débitos e indeterminados
+    começam desmarcados; linhas needs_review são destacadas com ⚠️.
+    """
+    rows = []
+    for idx, t in enumerate(raw):
+        if t.needs_review:
+            sinal, incluir, status = "⚠️ Indeterminado", False, "⚠️ Revisão manual obrigatória"
+        elif t.is_credit:
+            sinal, incluir, status = "Crédito", True, "Automático"
+        else:
+            sinal, incluir, status = "Débito", False, "Automático (fora da renda)"
+        rows.append({
+            "ID": idx,
+            "Data": t.date.strftime("%d/%m/%Y"),
+            "Descrição": t.description,
+            "Valor": t.amount,
+            "Sinal": sinal,
+            "Status": status,
+            "Incluir na apuração": incluir,
+            "Motivo da exclusão (manual)": "",
+        })
+    return pd.DataFrame(rows)
 
 
 def main():
     st.title("📊 Apuração de Renda via Extratos PDF")
     st.write("Anexe múltiplos extratos bancários em PDF para consolidar e gerar o relatório executivo.")
 
-    for key in ("raw_transactions", "metrics", "detected_holder", "institutions"):
+    for key, default in (("raw_transactions", None), ("metrics", None),
+                         ("detected_holder", ""), ("institutions", None),
+                         ("reviewed", False)):
         if key not in st.session_state:
-            st.session_state[key] = None if key in ("raw_transactions", "metrics") else ("" if key == "detected_holder" else set())
+            st.session_state[key] = default
 
-    uploaded_files = st.file_uploader("Selecione os arquivos PDF dos extratos",
-                                      type=["pdf"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "Selecione os arquivos PDF dos extratos", type=["pdf"], accept_multiple_files=True
+    )
 
-    holder_input = st.text_input("Nome do Titular (opcional - será tentada a auto-detecção)",
-                                 value=st.session_state.detected_holder or "")
+    holder_input = st.text_input(
+        "Nome do Titular (opcional - será tentada a auto-detecção)",
+        value=st.session_state.detected_holder or "",
+    )
 
+    # ------------------------------------------------------------------ #
+    # Etapa 1: extração + parsing (com status/progresso)
+    # ------------------------------------------------------------------ #
     if st.button("🚀 Processar Extratos", type="primary", disabled=not uploaded_files):
         raw_all = []
         institutions = set()
@@ -109,32 +122,31 @@ def main():
             progress = st.progress(0.0, text="Iniciando processamento...")
             total = len(uploaded_files)
 
-            for idx, uploaded_file in enumerate(uploaded_files):
-                status.update(label=f"Processando {uploaded_file.name} ({idx + 1}/{total})...")
+            for i, uf in enumerate(uploaded_files):
+                status.update(label=f"Processando {uf.name} ({i + 1}/{total})...")
                 try:
-                    text_pages = extract_text_from_pdf(uploaded_file)
-                    if not text_pages or not any(t.strip() for t in text_pages):
-                        st.warning(f"⚠️ O arquivo '{uploaded_file.name}' não pôde ser lido "
+                    pages = extract_text_from_pdf(uf)
+                    if not pages or not any(p.strip() for p in pages):
+                        st.warning(f"⚠️ O arquivo '{uf.name}' não pôde ser lido "
                                    f"(protegido por senha, corrompido ou sem camada de texto).")
                         continue
 
-                    full_text = "\n".join(text_pages)
+                    full_text = "\n".join(pages)
                     bank = detect_bank(full_text)
                     institutions.add(bank_display_name(bank))
 
                     if not detected_holder:
-                        detected_holder = try_detect_holder_name(text_pages)
+                        detected_holder = try_detect_holder_name(pages)
 
-                    txs = parse_statement(full_text, bank=bank, source_file=uploaded_file.name)
-                    status.write(f"✅ {uploaded_file.name}: {len(txs)} transações "
-                                 f"({bank_display_name(bank)})")
+                    txs = parse_statement(full_text, bank=bank, source_file=uf.name)
+                    status.write(f"✅ {uf.name}: {len(txs)} transações ({bank_display_name(bank)})")
                     raw_all.extend(txs)
                 except Exception as e:
-                    logger.error("Erro ao processar %s: %s", uploaded_file.name, e)
-                    st.error(f"❌ Erro inesperado ao processar '{uploaded_file.name}': {e}")
+                    logger.error("Erro ao processar %s: %s", uf.name, e)
+                    st.error(f"❌ Erro inesperado ao processar '{uf.name}': {e}")
 
-                progress.progress((idx + 1) / total,
-                                  text=f"Processando {uploaded_file.name} ({idx + 1}/{total})")
+                progress.progress((i + 1) / total,
+                                  text=f"Processando {uf.name} ({i + 1}/{total})")
 
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
@@ -142,38 +154,124 @@ def main():
         st.session_state.raw_transactions = raw_all
         st.session_state.institutions = institutions
         st.session_state.detected_holder = detected_holder or holder_input
-        st.session_state.metrics = calculate_income_metrics(raw_all) if raw_all else None
+        st.session_state.metrics = None
+        st.session_state.reviewed = False
+        if "review_df" in st.session_state:
+            del st.session_state["review_df"]
 
     raw = st.session_state.raw_transactions
+
+    if raw is None:
+        return
+
+    if not raw:
+        st.error("Nenhuma transação pôde ser extraída dos arquivos fornecidos.")
+        return
+
+    holder_name = holder_input or st.session_state.detected_holder or "Titular Não Identificado"
+    institutions = list(st.session_state.institutions or [])
+
+    # ------------------------------------------------------------------ #
+    # Etapa 2: transações brutas (antes das regras) para validação visual
+    # ------------------------------------------------------------------ #
+    with st.expander(f"🔎 Validar transações brutas extraídas ({len(raw)} lançamentos)"):
+        df_raw = pd.DataFrame([{
+            "Data": t.date.strftime("%d/%m/%Y"),
+            "Descrição": t.description,
+            "Valor": t.amount,
+            "Banco": bank_display_name(t.bank) if t.bank else "-",
+            "Arquivo": t.source_file or "-",
+        } for t in raw])
+        st.dataframe(df_raw, use_container_width=True, height=320)
+
+    # ------------------------------------------------------------------ #
+    # Etapa 3: revisão manual obrigatória (st.data_editor)
+    # ------------------------------------------------------------------ #
+    st.divider()
+    st.subheader("🖊️ Revisão Manual — obrigatória antes da exportação")
+    st.caption(
+        "Linhas ⚠️ tiveram sinal indeterminado pelo parser: decida manualmente. "
+        "Débitos ficam fora por padrão. Desmarque créditos que NÃO sejam renda "
+        "recorrente (ex.: Pix de parente) e informe o motivo na última coluna."
+    )
+
+    if "review_df" not in st.session_state:
+        st.session_state.review_df = build_review_dataframe(raw)
+
+    edited = st.data_editor(
+        st.session_state.review_df,
+        num_rows="fixed",
+        use_container_width=True,
+        height=420,
+        column_config={
+            "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+            "Data": st.column_config.TextColumn("Data", disabled=True, width="small"),
+            "Descrição": st.column_config.TextColumn("Descrição", disabled=True, width="large"),
+            "Valor": st.column_config.NumberColumn("Valor", disabled=True,
+                                                   format="R$ %.2f", width="small"),
+            "Sinal": st.column_config.TextColumn("Sinal Detectado", disabled=True, width="small"),
+            "Status": st.column_config.TextColumn("Status", disabled=True, width="medium"),
+            "Incluir na apuração": st.column_config.CheckboxColumn("Incluir na apuração"),
+            "Motivo da exclusão (manual)": st.column_config.TextColumn("Motivo da exclusão (manual)"),
+        },
+        key="review_editor",
+    )
+
+    if st.button("✅ Confirmar revisão e gerar relatório", type="primary"):
+        manual_inclusions = set()
+        manual_exclusions = {}
+
+        for _, row in edited.iterrows():
+            idx = int(row["ID"])
+            t = raw[idx]
+            incluir = bool(row["Incluir na apuração"])
+            motivo = str(row["Motivo da exclusão (manual)"] or "").strip()
+
+            if t.needs_review:
+                # Decisão explícita do operador sobre linha indeterminada
+                if incluir:
+                    manual_inclusions.add(idx)
+                else:
+                    manual_exclusions[idx] = (
+                        motivo or "Não confirmada como renda pelo operador na revisão"
+                    )
+            else:
+                # Crédito automático desmarcado = exclusão manual com motivo
+                if (t.is_credit or t.amount > 0) and not incluir:
+                    manual_exclusions[idx] = motivo or "Excluída manualmente pelo operador"
+                # Débito automático marcado: ignorado (débito nunca é renda)
+
+        st.session_state.manual_inclusions = manual_inclusions
+        st.session_state.manual_exclusions = manual_exclusions
+        st.session_state.metrics = calculate_income_metrics(
+            raw,
+            holder_name=holder_name,
+            manual_exclusions=manual_exclusions,
+            manual_inclusions=manual_inclusions,
+        )
+        st.session_state.reviewed = True
+        st.success("Revisão confirmada. Relatório e exportações liberados abaixo.")
+
+    # ------------------------------------------------------------------ #
+    # Etapa 4: resultados + exportações (somente após confirmação)
+    # ------------------------------------------------------------------ #
     metrics = st.session_state.metrics
 
-    if raw is not None:
+    if st.session_state.reviewed and metrics is not None:
         st.divider()
-
-        # --- Validação visual ANTES das regras (Item 5) ---
-        with st.expander(f"🔎 Validar transações brutas extraídas ({len(raw)} lançamentos)"):
-            if raw:
-                df_raw = pd.DataFrame([{
-                    "Data": t.date.strftime("%d/%m/%Y"),
-                    "Descrição": t.description,
-                    "Valor": t.amount,
-                    "Banco": bank_display_name(t.bank) if t.bank else "-",
-                    "Arquivo": t.source_file or "-",
-                } for t in raw])
-                st.dataframe(df_raw, use_container_width=True, height=320)
-            else:
-                st.info("Nenhuma transação bruta extraída. Verifique os dumps em logs/.")
-
-        if metrics is None or not raw:
-            st.error("Nenhuma transação pôde ser extraída dos arquivos fornecidos.")
-            return
-
         st.subheader("📈 Prévia dos Resultados")
+
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Geral Apurado", brl(metrics["total_geral"]))
         col2.metric("Média Mensal Geral", brl(metrics["media_mensal_geral"]))
         col3.metric("Média Meses Completos", brl(metrics["media_meses_completos"]))
-        st.divider()
+
+        revisao = metrics.get("revisao_manual", {})
+        st.caption(
+            f"Revisão: {len(revisao.get('incluidas', []))} lançamento(s) confirmado(s) "
+            f"manualmente como renda • {len(revisao.get('excluidas', []))} exclusão(ões) "
+            f"manuais/pendentes."
+        )
 
         st.subheader("Resumo Consolidado por Mês")
         if metrics["resumo_mensal"]:
@@ -205,9 +303,6 @@ def main():
 
         st.divider()
         st.subheader("📄 Relatório Executivo e Exportações")
-
-        holder_name = holder_input or st.session_state.detected_holder or "Titular Não Identificado"
-        institutions = list(st.session_state.institutions or [])
 
         col_pdf, col_xlsx, col_csv = st.columns(3)
         with col_pdf:

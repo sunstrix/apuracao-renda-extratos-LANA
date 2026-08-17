@@ -1,9 +1,19 @@
 """
 Geração de artefatos de saída:
-- generate_report(): PDF executivo (reportlab) com células em Paragraph,
-  garantindo quebra de linha e fim do estouro da coluna de valor;
+- generate_report(): PDF executivo (reportlab) com células em Paragraph
+  (quebra de linha correta, sem estouro de coluna);
 - generate_excel(): .xlsx com 3 abas (openpyxl);
-- generate_csv(): .csv (utf-8-sig, compatível com Excel BR).
+- generate_csv(): .csv (utf-8-sig, separador ';' para Excel pt-BR).
+
+Rastreabilidade da revisão manual (TAREFA 5):
+- lançamentos válidos confirmados manualmente pelo operador recebem o
+  marcador "*" na descrição + nota de rodapé explicativa;
+- motivos de exclusão manual chegam na coluna de motivo da auditoria
+  ("Excluída manualmente pelo usuário (motivo)"), produzidos pelo
+  rules_engine a partir do Dict[int, str] da tela de revisão.
+
+Compatibilidade: lê tx.manually_confirmed via getattr — transações sem o
+atributo (fluxos antigos) comportam-se como não-manuais.
 """
 import io
 import csv
@@ -27,6 +37,10 @@ GRAY_TEXT = colors.HexColor("#374151")
 LIGHT_GRAY = colors.HexColor("#F3F4F6")
 WHITE = colors.white
 
+NOTA_CONFIRMACAO_MANUAL = (
+    "* sinal de crédito/débito confirmado manualmente pelo operador"
+)
+
 
 def format_currency(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -36,11 +50,12 @@ def format_date(date_obj) -> str:
     return date_obj.strftime("%d/%m/%Y")
 
 
+def _is_manual(tx) -> bool:
+    """True se o lançamento foi confirmado manualmente pelo operador."""
+    return bool(getattr(tx, "manually_confirmed", False))
+
+
 def _build_cell_styles() -> Dict[str, ParagraphStyle]:
-    """
-    Estilos de célula com word-wrap. O reportlab NÃO quebra linha de string
-    pura dentro de Table — por isso TODAS as células viram Paragraph.
-    """
     base = getSampleStyleSheet()
     cell = ParagraphStyle("Cell", parent=base["Normal"], fontName="Helvetica",
                           fontSize=7.5, leading=9.5, textColor=GRAY_TEXT)
@@ -54,16 +69,16 @@ def _build_cell_styles() -> Dict[str, ParagraphStyle]:
                                  fontSize=8, textColor=WHITE, alignment=TA_CENTER),
         "head_r": ParagraphStyle("HeadR", parent=cell, fontName="Helvetica-Bold",
                                  fontSize=8, textColor=WHITE, alignment=TA_RIGHT),
-        "tot_l": ParagraphStyle("TotL", parent=cell, fontName="Helvetica-Bold"),
         "tot_c": ParagraphStyle("TotC", parent=cell, fontName="Helvetica-Bold",
                                 alignment=TA_CENTER),
         "tot_r": ParagraphStyle("TotR", parent=cell, fontName="Helvetica-Bold",
                                 alignment=TA_RIGHT),
+        "note": ParagraphStyle("Note", parent=base["Normal"], fontSize=8,
+                               textColor=GRAY_TEXT),
     }
 
 
 def _zebra(style_cmds: List, nrows: int, first_data_row: int = 1):
-    """Adiciona zebra striping + bordas + padding a uma tabela."""
     for i in range(first_data_row, nrows):
         style_cmds.append(("BACKGROUND", (0, i), (-1, i),
                            LIGHT_GRAY if i % 2 == 0 else WHITE))
@@ -78,7 +93,8 @@ def _zebra(style_cmds: List, nrows: int, first_data_row: int = 1):
     return style_cmds
 
 
-def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: List[str]) -> io.BytesIO:
+def generate_report(metrics: Dict[str, Any], holder_name: str,
+                    institutions: List[str]) -> io.BytesIO:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
@@ -94,13 +110,15 @@ def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: Lis
                                  fontName="Helvetica-Bold")
     subtitle_style = ParagraphStyle("CustomSubtitle", parent=styles["Normal"], fontSize=11,
                                     textColor=GRAY_TEXT, alignment=TA_CENTER, spaceAfter=20)
-    section_title_style = ParagraphStyle("SectionTitle", parent=styles["Heading2"], fontSize=13,
-                                         textColor=PRIMARY_BLUE, spaceBefore=20, spaceAfter=10,
+    section_title_style = ParagraphStyle("SectionTitle", parent=styles["Heading2"],
+                                         fontSize=13, textColor=PRIMARY_BLUE,
+                                         spaceBefore=20, spaceAfter=10,
                                          fontName="Helvetica-Bold")
     footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8,
                                   textColor=colors.gray, alignment=TA_CENTER)
     kpi_value_style = ParagraphStyle("kpi_val", parent=subtitle_style,
-                                     textColor=PRIMARY_BLUE, fontSize=14, alignment=TA_CENTER)
+                                     textColor=PRIMARY_BLUE, fontSize=14,
+                                     alignment=TA_CENTER)
 
     story = []
     story.append(Paragraph("Relatório Executivo de Apuração de Renda", title_style))
@@ -155,30 +173,37 @@ def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: Lis
     story.append(resumo_table)
     story.append(Spacer(1, 1 * cm))
 
-    # --- Detalhamento de Entradas Válidas ---
+    # --- Detalhamento de Entradas Válidas (com marcador de confirmação manual) ---
     story.append(Paragraph("Detalhamento de Entradas Válidas Consideradas", section_title_style))
     valid_txs = metrics.get("entradas_validas", [])
+    manual_count = 0
     if valid_txs:
         detail_data = [[Paragraph("Data", S["head_c"]),
                         Paragraph("Descrição da Entrada", S["head_l"]),
                         Paragraph("Valor", S["head_r"])]]
         for tx in valid_txs:
+            desc = escape(tx.description or "-")
+            if _is_manual(tx):
+                desc += " *"
+                manual_count += 1
             detail_data.append([
                 Paragraph(format_date(tx.date), S["cell_c"]),
-                Paragraph(escape(tx.description or "-"), S["cell_l"]),
+                Paragraph(desc, S["cell_l"]),
                 Paragraph(format_currency(tx.amount), S["cell_r"]),
             ])
-        # 17cm úteis: data 2,5 + descrição 11 + valor 3,5
         detail_table = Table(detail_data, colWidths=[2.5 * cm, 11 * cm, 3.5 * cm], repeatRows=1)
         detail_table.setStyle(TableStyle(_zebra([
             ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_BLUE),
         ], len(detail_data))))
         story.append(detail_table)
+        if manual_count > 0:
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph(NOTA_CONFIRMACAO_MANUAL, S["note"]))
     else:
         story.append(Paragraph("Nenhuma entrada válida encontrada.", subtitle_style))
     story.append(Spacer(1, 1 * cm))
 
-    # --- Tabela de Auditoria ---
+    # --- Tabela de Auditoria (motivos automáticos E manuais na mesma coluna) ---
     story.append(Paragraph("Tabela de Auditoria (Valores Excluídos)", section_title_style))
     excluded_txs = metrics.get("entradas_excluidas", [])
     if excluded_txs:
@@ -206,7 +231,8 @@ def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: Lis
         "Nota Metodológica: Este relatório consolida entradas financeiras identificadas nos "
         "extratos fornecidos, excluindo transferências de mesma titularidade, rendimentos de "
         "investimentos e créditos de jogos/apostas, conforme regras de negócio configuradas. "
-        "A média de meses completos considera apenas períodos com mais de 20 dias de extrato."
+        "A média de meses completos considera apenas períodos com mais de 20 dias de extrato. "
+        "Lançamentos marcados com '*' tiveram o sinal confirmado manualmente pelo operador."
     )
     story.append(Paragraph(footer_text, footer_style))
     doc.build(story)
@@ -214,9 +240,6 @@ def generate_report(metrics: Dict[str, Any], holder_name: str, institutions: Lis
     return buffer
 
 
-# ---------------------------------------------------------------------------
-# Exportação Excel / CSV
-# ---------------------------------------------------------------------------
 def _excel_header_style(ws, ncols: int):
     from openpyxl.styles import Font, PatternFill
     fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
@@ -228,7 +251,6 @@ def _excel_header_style(ws, ncols: int):
 
 def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
                    institutions: List[str] = None) -> bytes:
-    """Gera .xlsx com 3 abas: Resumo_Mensal, Entradas_Validas, Auditoria_Excluidos."""
     from openpyxl import Workbook
 
     wb = Workbook()
@@ -254,15 +276,22 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     ws1.column_dimensions["C"].width = 22
 
     ws2 = wb.create_sheet("Entradas_Validas")
-    ws2.append(["Data", "Descrição da Entrada", "Valor", "Banco"])
-    _excel_header_style(ws2, 4)
+    ws2.append(["Data", "Descrição da Entrada", "Valor", "Banco", "Obs."])
+    _excel_header_style(ws2, 5)
+    manual_any = False
     for tx in metrics.get("entradas_validas", []):
+        manual = _is_manual(tx)
+        manual_any = manual_any or manual
         ws2.append([format_date(tx.date), tx.description, round(tx.amount, 2),
-                    getattr(tx, "bank", "")])
+                    getattr(tx, "bank", ""), "*" if manual else ""])
+    if manual_any:
+        ws2.append([])
+        ws2.append([NOTA_CONFIRMACAO_MANUAL])
     ws2.column_dimensions["A"].width = 12
     ws2.column_dimensions["B"].width = 80
     ws2.column_dimensions["C"].width = 14
     ws2.column_dimensions["D"].width = 14
+    ws2.column_dimensions["E"].width = 8
 
     ws3 = wb.create_sheet("Auditoria_Excluidos")
     ws3.append(["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"])
@@ -272,7 +301,7 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
                     round(item["amount"], 2)])
     ws3.column_dimensions["A"].width = 12
     ws3.column_dimensions["B"].width = 80
-    ws3.column_dimensions["C"].width = 45
+    ws3.column_dimensions["C"].width = 50
     ws3.column_dimensions["D"].width = 14
 
     buf = io.BytesIO()
@@ -281,7 +310,6 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
 
 
 def generate_csv(metrics: Dict[str, Any]) -> bytes:
-    """Gera .csv único com as 3 seções (utf-8-sig para acentos corretos no Excel)."""
     out = io.StringIO()
     w = csv.writer(out, delimiter=";")
 
@@ -296,10 +324,17 @@ def generate_csv(metrics: Dict[str, Any]) -> bytes:
     w.writerow([])
 
     w.writerow(["ENTRADAS VÁLIDAS"])
-    w.writerow(["Data", "Descrição da Entrada", "Valor", "Banco"])
+    w.writerow(["Data", "Descrição da Entrada", "Valor", "Banco", "Obs."])
+    manual_any = False
     for tx in metrics.get("entradas_validas", []):
+        manual = _is_manual(tx)
+        manual_any = manual_any or manual
         w.writerow([format_date(tx.date), tx.description,
-                    f"{tx.amount:.2f}".replace(".", ","), getattr(tx, "bank", "")])
+                    f"{tx.amount:.2f}".replace(".", ","), getattr(tx, "bank", ""),
+                    "*" if manual else ""])
+    if manual_any:
+        w.writerow([])
+        w.writerow([NOTA_CONFIRMACAO_MANUAL])
     w.writerow([])
 
     w.writerow(["AUDITORIA - EXCLUÍDOS"])

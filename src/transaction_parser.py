@@ -25,7 +25,6 @@ from dateutil import parser as date_parser
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class Transaction:
     date: date
@@ -35,7 +34,7 @@ class Transaction:
     bank: str = ""
     source_file: str = ""
     needs_review: bool = False
-
+    manually_confirmed: bool = False  # BUG-1 FIX: Evitar AttributeError em report_generator
 
 # ---------------------------------------------------------------------------
 # Constantes compartilhadas
@@ -47,7 +46,7 @@ MESES_PT = {
 
 DATE_FULL_REGEX = r'\b(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\b'
 DATE_SHORT_REGEX = r'^(\d{1,2}[\/\.\-]\d{1,2})\b'
-MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])[\/\.\-](20\d{2})$'
+MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])\/\.\-$'
 MONEY_REGEX = r'(?:R\$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
 MONEY_END_REGEX = r'([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\s*$'
 
@@ -98,16 +97,13 @@ NU_DEBIT_HINTS = (
     "resgate de emprestimo",
 )
 
-
 def _normalize_text(text: str) -> str:
     """Remove acentos e baixa caixa para análise estatística/semântica."""
     nfkd = unicodedata.normalize("NFKD", text or "")
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower()
 
-
 def _month_from_token(token: str) -> Optional[int]:
     return MESES_PT.get(_normalize_text(token)[:3].upper())
-
 
 def parse_money_value(text: str) -> float:
     """Converte 'R$ 1.234,56' / '-1.234,56' / '1500,00' -> float."""
@@ -123,7 +119,6 @@ def parse_money_value(text: str) -> float:
     except ValueError:
         return 0.0
 
-
 def _semantic_credit_debit(description: str) -> Optional[bool]:
     """
     Fallback semântico baseado em palavras-chave da descrição.
@@ -136,7 +131,6 @@ def _semantic_credit_debit(description: str) -> Optional[bool]:
         return False
     return None
 
-
 def _decide_credit(amount_str: str, section: Optional[str], description: str):
     """
     Decide (is_credit, amount, needs_review) em camadas:
@@ -145,21 +139,31 @@ def _decide_credit(amount_str: str, section: Optional[str], description: str):
     3) fallback semântico por palavras-chave (somente se 1 e 2 ausentes);
     4) indeterminado -> is_credit=None, needs_review=True, valor como veio
        (sem forçar sinal): a decisão final é do operador na tela de revisão.
+    
+    BUG-2 FIX: Sinal explícito tem prioridade ABSOLUTA sobre seção.
     """
     amount = parse_money_value(amount_str)
+    
+    # PRIORIDADE 1: Sinal explícito tem precedência absoluta
     if amount_str.startswith("-") or amount_str.startswith("+"):
+        # Se já tem sinal explícito, respeite-o SEM aplicar regra de seção
         return (not amount_str.startswith("-")), amount, False
+    
+    # PRIORIDADE 2: Seção (apenas se NÃO há sinal explícito)
     if section == "E":
         return True, abs(amount), False
     if section == "S":
         return False, -abs(amount), False
+    
+    # PRIORIDADE 3: Fallback semântico
     sem = _semantic_credit_debit(description)
     if sem is True:
         return True, abs(amount), False
     if sem is False:
         return False, -abs(amount), False
+    
+    # PRIORIDADE 4: Indeterminado - revisão manual
     return None, amount, True
-
 
 def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
     """Heurística de crédito/débito para o parser genérico (bancos dd/mm)."""
@@ -179,7 +183,6 @@ def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
         return False
     return None
 
-
 def _build_date(date_str: str, is_short: bool, context_year: Optional[int]) -> Optional[date]:
     try:
         if is_short:
@@ -189,7 +192,6 @@ def _build_date(date_str: str, is_short: bool, context_year: Optional[int]) -> O
     except (ValueError, OverflowError):
         return None
 
-
 def _clean_description(line: str, date_str: str, amount_str: str) -> str:
     desc = line
     if date_str:
@@ -198,7 +200,6 @@ def _clean_description(line: str, date_str: str, amount_str: str) -> str:
         desc = desc.replace(amount_str, " ", 1)
     desc = desc.replace("R$", " ")
     return re.sub(r"\s+", " ", desc).strip(" -–|*")
-
 
 def _nu_date_from_line(line: str) -> Optional[date]:
     """Data de cabeçalho Nubank com ruído de OCR (O1ABR2026, 1O0MAR2026...)."""
@@ -222,7 +223,6 @@ def _nu_date_from_line(line: str) -> Optional[date]:
         return date(int(year), month, day)
     except ValueError:
         return None
-
 
 # ---------------------------------------------------------------------------
 # Parser genérico (fallback universal)
@@ -319,10 +319,8 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
 
     return transactions
 
-
 def parse_generic(text: str, bank: str = "generic", source_file: str = "") -> List[Transaction]:
     return _parse_generic_lines(text, bank, source_file)
-
 
 # ---------------------------------------------------------------------------
 # Parser Nubank
@@ -437,7 +435,6 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     txs.sort(key=lambda t: t.date)
     return txs
 
-
 # ---------------------------------------------------------------------------
 # Parsers específicos dos demais bancos (config sobre o genérico)
 # ---------------------------------------------------------------------------
@@ -445,26 +442,21 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
     """Itaú: 'dd/mm descrição valor C/D'."""
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
-
 def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> List[Transaction]:
     """Bradesco: 'dd/mm descrição valor' com C/D eventual."""
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
-
 
 def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
     """Santander: layout dd/mm padrão."""
     return _parse_generic_lines(text, bank, source_file)
 
-
 def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[Transaction]:
     """Caixa: layout dd/mm/aaaa padrão."""
     return _parse_generic_lines(text, bank, source_file)
 
-
 def parse_bb(text: str, bank: str = "bb", source_file: str = "") -> List[Transaction]:
     """Banco do Brasil: layout dd/mm padrão."""
     return _parse_generic_lines(text, bank, source_file)
-
 
 # ---------------------------------------------------------------------------
 # Dispatcher + compatibilidade
@@ -478,7 +470,6 @@ _PARSERS = {
     "bb": parse_bb,
 }
 
-
 def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> List[Transaction]:
     """Escolhe o parser do banco; se ele não produzir nada, usa o genérico."""
     parser_fn = _PARSERS.get(bank, parse_generic)
@@ -488,7 +479,6 @@ def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> 
                     bank, source_file or "PDF")
         txs = parse_generic(text, bank=bank, source_file=source_file)
     return txs
-
 
 def parse_pdf_pages(pages_text: List[str]) -> List[Transaction]:
     """Compatibilidade retroativa: parse genérico de todas as páginas."""

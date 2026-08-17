@@ -15,8 +15,13 @@ Pillow>=10.0.0
 reportlab>=4.0.0
 openpyxl>=3.1.0
 
-# --- Integração Gemini (fallback de extração) ---
-google-generativeai>=0.8.0
+# --- Integração Gemini ---
+# SDK usado pelo src/gemini_extractor.py ("from google import genai").
+# O pacote legado google-generativeai NÃO fornece google.genai — por isso
+# o ImportError anterior.
+google-genai>=1.0.0
+
+# --- Variáveis de ambiente (.env) ---
 python-dotenv>=1.0.0
 
 # --- Testes ---

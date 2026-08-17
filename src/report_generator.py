@@ -25,7 +25,8 @@ FIX H: marcador de rastreabilidade da extração via IA — lançamentos com
 extraction_source="gemini" (atributo dinâmico setado pelo
 gemini_extractor) recebem selo "[IA]" no PDF e "🤖" no Excel/CSV
 (Helvetica não possui glifos de emoji, daí a diferença de selo),
-+ nota de rodapé e contagem no resumo.
++ nota de rodapé e contagem no resumo. Compatibilidade: getattr —
+transações sem o atributo (fluxo local) não recebem selo.
 """
 import io
 import csv
@@ -367,7 +368,7 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
         manual_any = manual_any or manual
         ia_any = ia_any or gemini
         # FIX H: selo 🤖 no Excel (Unicode suportado); combina com "*" se ambos.
-        obs = ("*" if manual else "") + ("" if gemini else "")
+        obs = ("*" if manual else "") + ("🤖" if gemini else "")
         ws2.append([format_date(tx.date), tx.description, round(tx.amount, 2),
                     getattr(tx, "bank", ""), obs])
     if manual_any:

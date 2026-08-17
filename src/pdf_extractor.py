@@ -7,12 +7,16 @@ Arquitetura:
 - Gate de legibilidade para detectar texto corrompido
 - Cache com @st.cache_data para evitar reprocessamento
 - DPI adaptativo para OCR (150 → 200 se qualidade baixa)
+- A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
+  e seleção de idioma via pytesseract.get_languages() quando o diretório
+  não é resolvido por filesystem.
 """
 import io
 import os
 import re
 import shutil
 import logging
+import platform
 import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
 import hashlib
@@ -98,6 +102,23 @@ MIN_TOKEN_LEN = 2
 # Caminho padrão do Tesseract no Windows (instalador UB-Mannheim via winget)
 TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# ---------------------------------------------------------------------------
+# A2 — candidatos de tessdata no Linux (apt, compilação própria, contêineres)
+# ---------------------------------------------------------------------------
+# No Windows o layout é resolvido relativo ao executável (ver
+# _resolve_tessdata_dir). No Linux, os pacotes apt (tesseract-ocr-por/eng)
+# instalam os .traineddata em caminhos versionados que variam por distro;
+# por isso a lista de candidatos + fallback via pytesseract.get_languages().
+TESSDATA_LINUX_CANDIDATES = (
+    "/usr/share/tesseract-ocr/5/tessdata",
+    "/usr/share/tesseract-ocr/4.13/tessdata",
+    "/usr/share/tesseract-ocr/4.11/tessdata",
+    "/usr/share/tesseract-ocr/4/tessdata",
+    "/usr/share/tessdata",
+    "/usr/local/share/tessdata",
+    "/app/tessdata",
+)
+
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
     """
@@ -108,7 +129,7 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
         os.makedirs(DEBUG_DIR, exist_ok=True)
         safe_name = "".join(c for c in source_name if c.isalnum() or c in ".-_")
         path = os.path.join(DEBUG_DIR, f"debug_extracao_{safe_name}.txt")
-        
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"ORIGEM DA EXTRACAO: {origin}\n")
             f.write(f"ARQUIVO: {source_name}\n")
@@ -154,20 +175,20 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
     """
     Heurística agnóstica de biblioteca para detectar texto embaralhado
     (mojibake de fonte sem ToUnicode).
-    
+
     Regra de decisão: o texto SÓ é aceito como legível se AMBOS os sinais
     indicarem texto natural:
       (a) proporção de vogais dentro da faixa esperada, E
       (b) razão de palavras reais do português acima dos limites calibrados.
-    
+
     Se QUALQUER um dos dois falhar, o texto é considerado corrompido.
-    
+
     Retorna (eh_garbled, detalhe) com o detalhe indicando exatamente qual
     sinal aprovou/reprovou, para facilitar diagnóstico futuro.
     """
     vowel_ratio = _vowel_ratio(text)
     vowel_ok = VOWEL_RATIO_MIN <= vowel_ratio <= VOWEL_RATIO_MAX
-    
+
     hits, total = _real_word_stats(text)
     if total < MIN_ALPHA_TOKENS:
         words_ok = False
@@ -178,13 +199,13 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
         ratio = hits / total
         words_ok = (hits >= MIN_REAL_WORD_HITS) and (ratio >= REAL_WORD_RATIO_MIN)
         words_detail = f"palavras reais {hits}/{total} ({ratio:.2%})"
-    
+
     if vowel_ok and words_ok:
         return False, (
             f"texto aceito: vogais {vowel_ratio:.2%} na faixa esperada E "
             f"{words_detail} acima do limite"
         )
-    
+
     reasons = []
     if not vowel_ok:
         reasons.append(
@@ -193,7 +214,7 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
         )
     if not words_ok:
         reasons.append(f"{words_detail} abaixo do limite exigido")
-    
+
     return True, "texto corrompido: " + " E ".join(reasons)
 
 
@@ -207,7 +228,7 @@ def _pages_readable(pages_text: List[str]) -> bool:
     total_text = "\n".join(pages_text or [])
     if not total_text.strip():
         return False
-    
+
     # Gate 1: marcadores (cid:) do pdfplumber
     cid_count = total_text.count("(cid:")
     if cid_count > 0:
@@ -219,70 +240,168 @@ def _pages_readable(pages_text: List[str]) -> bool:
                 cid_count, ratio, CID_RATIO_THRESHOLD,
             )
             return False
-    
+
     # Gate 2+3: vogais E palavras reais
     garbled, detail = _looks_like_garbled_text(total_text)
     if garbled:
         logger.warning("Gate de legibilidade REPROVOU: %s", detail)
         return False
-    
+
     logger.info("Gate de legibilidade APROVOU: %s", detail)
     return True
 
 
-def _ensure_tesseract_cmd() -> Optional[str]:
+def _dir_has_traineddata(path: Optional[str]) -> bool:
+    """True se o diretório existe e contém ao menos um .traineddata."""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        return any(name.endswith(".traineddata") for name in os.listdir(path))
+    except Exception as e:
+        logger.warning("Não foi possível listar %s: %s", path, e)
+        return False
+
+
+def _resolve_tessdata_dir(exe: str) -> Optional[str]:
     """
-    Localiza o executável do Tesseract, aponta o pytesseract para ele e
-    define TESSDATA_PREFIX explicitamente (sempre, mesmo que já exista, para
-    garantir consistência entre sessões).
-    
-    Retorna o diretório tessdata resolvido, ou None se o executável não for
-    encontrado.
+    A2: resolve o diretório tessdata de forma cross-platform.
+
+    Ordem de candidatos:
+    1. TESSDATA_PREFIX já definido e válido;
+    2. pasta 'tessdata' ao lado do executável (layout padrão Windows);
+    3. candidatos Linux (apt/compilado/contêiner);
+    4. None — o chamador então NÃO seta TESSDATA_PREFIX e confia no default
+       compilado do Tesseract (caso típico de instalações apt no Linux),
+       delegando a detecção de idioma a _pick_ocr_lang().
+    """
+    candidates: List[str] = []
+
+    env_prefix = os.environ.get("TESSDATA_PREFIX")
+    if env_prefix:
+        candidates.append(env_prefix)
+
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(exe)), "tessdata")
+    )
+
+    if platform.system() == "Windows":
+        candidates.append(
+            os.path.join(os.path.dirname(TESSERACT_WINDOWS_PATH), "tessdata")
+        )
+    else:
+        candidates.extend(TESSDATA_LINUX_CANDIDATES)
+
+    for cand in candidates:
+        if _dir_has_traineddata(cand):
+            return cand
+    return None
+
+
+def _ensure_tesseract_cmd() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Localiza o executável do Tesseract e aponta o pytesseract para ele.
+
+    A2 (correção online): TESSDATA_PREFIX agora é definido SOMENTE se um
+    diretório válido for resolvido por _resolve_tessdata_dir(). Antes, o
+    código setava o prefixo incondicionalmente para <pasta do exe>/tessdata,
+    que no Linux vira /usr/bin/tessdata (inexistente) — fazendo a checagem de
+    por.traineddata falhar e abortar o OCR mesmo com Tesseract instalado.
+
+    Retorna (exe, tessdata_dir); exe=None significa Tesseract ausente.
     """
     exe = shutil.which("tesseract")
     if exe is None and os.path.exists(TESSERACT_WINDOWS_PATH):
         exe = TESSERACT_WINDOWS_PATH
-    
+
     if exe is None:
         logger.error(
             "Executável do Tesseract não encontrado no PATH nem em %s.",
             TESSERACT_WINDOWS_PATH,
         )
-        return None
-    
+        return None, None
+
     try:
         import pytesseract
         pytesseract.pytesseract.tesseract_cmd = exe
     except Exception as e:
         logger.warning("Não foi possível configurar pytesseract.tesseract_cmd: %s", e)
-    
-    # tessdata normalmente é a subpasta "tessdata" ao lado do executável.
-    # Se o executável veio de um shim (ex: chocolatey), tenta o caminho padrão
-    # do instalador UB-Mannheim.
-    tessdata_dir = os.path.join(os.path.dirname(os.path.abspath(exe)), "tessdata")
-    if not os.path.isdir(tessdata_dir):
-        win_candidate = os.path.join(
-            os.path.dirname(TESSERACT_WINDOWS_PATH), "tessdata"
+
+    tessdata_dir = _resolve_tessdata_dir(exe)
+    if tessdata_dir:
+        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+        logger.info("TESSDATA_PREFIX definido para %s", tessdata_dir)
+    else:
+        logger.info(
+            "Nenhum diretório tessdata explícito encontrado; confiando no "
+            "default compilado do Tesseract (comum em instalações apt/Linux). "
+            "Idiomas serão consultados via pytesseract.get_languages()."
         )
-        if os.path.isdir(win_candidate):
-            tessdata_dir = win_candidate
-    
-    os.environ["TESSDATA_PREFIX"] = tessdata_dir
-    logger.info("TESSDATA_PREFIX definido para %s", tessdata_dir)
-    return tessdata_dir
+    return exe, tessdata_dir
+
+
+def _pick_ocr_lang(tessdata_dir: Optional[str]) -> Optional[str]:
+    """
+    A2: escolhe o idioma do OCR, preferindo 'por' com fallback 'eng'.
+
+    Com tessdata_dir resolvido, usa filesystem (rápido). Sem diretório
+    resolvido, consulta o próprio Tesseract via pytesseract.get_languages()
+    — caminho confiável no Linux/apt, onde o default compilado funciona sem
+    TESSDATA_PREFIX.
+
+    Retorna None (com log de erro acionável) se nenhum idioma usável.
+    """
+    if tessdata_dir:
+        if os.path.exists(os.path.join(tessdata_dir, "por.traineddata")):
+            return "por"
+        if os.path.exists(os.path.join(tessdata_dir, "eng.traineddata")):
+            logger.error(
+                "Pacote de idioma 'Português' do Tesseract NÃO está instalado. "
+                "Arquivo esperado: %s. "
+                "Solução: baixe por.traineddata em "
+                "https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata "
+                "e copie para a pasta indicada. "
+                "ÚLTIMO RECURSO: executando OCR com lang='eng' (qualidade REDUZIDA "
+                "para texto em português — dígitos, datas e valores seguem confiáveis).",
+                os.path.join(tessdata_dir, "por.traineddata"),
+            )
+            return "eng"
+
+    # Sem diretório resolvido (ou sem por/eng nele): pergunta ao Tesseract.
+    try:
+        import pytesseract
+        langs = set(pytesseract.get_languages())
+        if "por" in langs:
+            return "por"
+        if "eng" in langs:
+            logger.error(
+                "Pacote de idioma 'por' ausente no Tesseract; usando 'eng' "
+                "(qualidade REDUZIDA para português). "
+                "Linux: apt install tesseract-ocr-por."
+            )
+            return "eng"
+    except Exception as e:
+        logger.warning("Consulta de idiomas do Tesseract falhou: %s", e)
+
+    logger.error(
+        "Nenhum pacote de idioma disponível (nem 'por', nem 'eng'). "
+        "OCR abortado para este arquivo. "
+        "Linux: apt install tesseract-ocr-por tesseract-ocr-eng | "
+        "Windows: copie os .traineddata para a pasta tessdata."
+    )
+    return None
 
 
 def pdf_has_text(file_bytes: bytes) -> bool:
     """
     PERF-3: Detecção rápida de texto vs imagem usando PyMuPDF.
-    
+
     Verifica se o PDF possui camada de texto extraível em pelo menos uma página.
     Esta verificação é feita ANTES de qualquer tentativa de OCR, evitando
     processamento desnecessário em PDFs nativos.
-    
+
     Args:
         file_bytes: Conteúdo do PDF em bytes
-        
+
     Returns:
         True se o PDF tem texto extraível, False caso contrário
     """
@@ -305,32 +424,32 @@ def pdf_has_text(file_bytes: bytes) -> bool:
 def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
     """
     PERF-4: OCR com DPI adaptativo.
-    
+
     Tenta OCR com DPI 150 primeiro (mais rápido); se qualidade for baixa,
     reprocessa com DPI 200 (mais lento, mas confiável).
-    
+
     Args:
         page: Página do PyMuPDF
         lang: Idioma do OCR ('por' ou 'eng')
-        
+
     Returns:
         Texto extraído via OCR
     """
     import pytesseract
-    
+
     # Tentativa 1: DPI baixo (mais rápido)
     pix = page.get_pixmap(dpi=150)
     image = Image.open(io.BytesIO(pix.tobytes("png")))
     text = pytesseract.image_to_string(image, lang=lang)
     image.close()
-    
+
     # Valida qualidade usando gate de legibilidade
     hits, total = _real_word_stats(text)
     if total >= MIN_ALPHA_TOKENS and (hits / total) >= (REAL_WORD_RATIO_MIN * 0.8):
         logger.info(f"OCR com DPI 150 aceitável ({hits}/{total} palavras)")
         del pix
         return text
-    
+
     # Tentativa 2: DPI alto (mais lento, mas confiável)
     logger.info(f"OCR com DPI 150 insuficiente; retentando com DPI 200")
     pix = page.get_pixmap(dpi=200)
@@ -339,7 +458,7 @@ def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
     image.close()
     del pix
     del image
-    
+
     return text
 
 
@@ -351,23 +470,24 @@ def _compute_file_hash(file_bytes: bytes) -> str:
 def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str]:
     """
     Implementação interna da extração de texto (sem cache).
-    
+
     PERF-1: Inverteu a prioridade para fitz > pdfplumber > OCR.
-    
+    A2: resolução de tessdata cross-platform + seleção de idioma robusta.
+
     Args:
         file_bytes: Conteúdo do PDF em bytes
         source_name: Nome do arquivo para logging
-        
+
     Returns:
         Lista de strings (uma por página)
     """
     pages_text: List[str] = []
-    
+
     # PERF-3: Verificação rápida de texto antes de qualquer extração
     has_text = pdf_has_text(file_bytes)
     if not has_text:
         logger.info(f"PDF sem camada de texto detectada. Partindo direto para OCR.")
-    
+
     # Camada 1: PyMuPDF (fitz) - MAIS RÁPIDO para texto puro
     if has_text:
         try:
@@ -376,16 +496,16 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
                     logger.warning("PDF protegido por senha detectado no PyMuPDF.")
                     return []
                 pages_text = [page.get_text("text") for page in doc]
-            
+
             if _pages_readable(pages_text):
                 _dump_debug_text(source_name, pages_text, "pymupdf")
                 logger.info(f"Extração bem-sucedida via PyMuPDF (fitz)")
                 return pages_text
-            
+
             logger.warning("PyMuPDF retornou texto corrompido; tentando pdfplumber.")
         except Exception as e:
             logger.warning(f"Falha na extração via PyMuPDF: {e}")
-    
+
     # Camada 2: pdfplumber (fallback para tabelas complexas)
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -393,16 +513,16 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
                 logger.warning("PDF protegido por senha detectado.")
                 return []
             pages_text = [page.extract_text() or "" for page in pdf.pages]
-        
+
         if _pages_readable(pages_text):
             _dump_debug_text(source_name, pages_text, "pdfplumber")
             logger.info(f"Extração bem-sucedida via pdfplumber")
             return pages_text
-        
+
         logger.warning("pdfplumber retornou texto corrompido; partindo para OCR.")
     except Exception as e:
         logger.warning(f"Falha na extração via pdfplumber: {e}")
-    
+
     # Camada 3: OCR (pytesseract) — lê os glifos renderizados,
     # contornando fontes sem mapa Unicode e PDFs escaneados.
     try:
@@ -410,38 +530,16 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
     except ImportError:
         logger.error("pytesseract não instalado. OCR indisponível.")
         return []
-    
-    tessdata_dir = _ensure_tesseract_cmd()
-    if tessdata_dir is None:
+
+    # A2: novo contrato — (exe, tessdata_dir); tessdata_dir pode ser None.
+    exe, tessdata_dir = _ensure_tesseract_cmd()
+    if exe is None:
         return []
-    
-    # Verificação explícita do pacote de idioma ANTES de chamar o Tesseract.
-    por_traineddata = os.path.join(tessdata_dir, "por.traineddata")
-    if os.path.exists(por_traineddata):
-        ocr_lang = "por"
-    else:
-        # Erro legível e específico (não a exceção crua): cita o caminho
-        # exato que falta e como resolver.
-        logger.error(
-            "Pacote de idioma 'Português' do Tesseract NÃO está instalado. "
-            "Arquivo esperado: %s. "
-            "Solução: baixe por.traineddata em "
-            "https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata "
-            "e copie para a pasta indicada. "
-            "ÚLTIMO RECURSO: executando OCR com lang='eng' (qualidade REDUZIDA "
-            "para texto em português — dígitos, datas e valores seguem confiáveis).",
-            por_traineddata,
-        )
-        eng_traineddata = os.path.join(tessdata_dir, "eng.traineddata")
-        if not os.path.exists(eng_traineddata):
-            logger.error(
-                "Nenhum pacote de idioma disponível em %s (nem 'por', nem 'eng'). "
-                "OCR abortado para este arquivo.",
-                tessdata_dir,
-            )
-            return []
-        ocr_lang = "eng"
-    
+
+    ocr_lang = _pick_ocr_lang(tessdata_dir)
+    if ocr_lang is None:
+        return []
+
     try:
         pages_text = []
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
@@ -450,7 +548,7 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
                 # PERF-4: DPI adaptativo (150 primeiro, 200 se qualidade baixa)
                 text = _ocr_with_adaptive_dpi(page, lang=ocr_lang)
                 pages_text.append(text)
-        
+
         _dump_debug_text(source_name, pages_text, f"ocr_{ocr_lang}")
         logger.info(f"Extração bem-sucedida via OCR ({ocr_lang})")
         return pages_text
@@ -465,19 +563,20 @@ if STREAMLIT_AVAILABLE:
     def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
         """
         Extrai o texto de um PDF com fallback em camadas e gate de legibilidade.
-        
+
         PERF-1: Prioridade invertida para fitz (PyMuPDF) > pdfplumber > OCR.
         PERF-2: Cache com @st.cache_data para evitar reprocessamento.
         PERF-3: Detecção inteligente de texto vs imagem antes do OCR.
         PERF-4: DPI adaptativo para OCR (150 → 200 se qualidade baixa).
-        
+        A2: tessdata cross-platform + seleção de idioma robusta.
+
         Contrato de retorno mantido: List[str] (uma string por página),
         lista vazia se nada funcionar.
         """
         source_name = getattr(file_obj, "name", "desconhecido.pdf")
         file_obj.seek(0)
         file_bytes = file_obj.read()
-        
+
         logger.info(f"Iniciando extração de texto de {source_name}")
         return _extract_text_from_pdf_impl(file_bytes, source_name)
 else:
@@ -485,13 +584,13 @@ else:
     def extract_text_from_pdf(file_obj: io.BytesIO) -> List[str]:
         """
         Extrai o texto de um PDF com fallback em camadas e gate de legibilidade.
-        
+
         Versão sem cache (para ambientes sem Streamlit).
         """
         source_name = getattr(file_obj, "name", "desconhecido.pdf")
         file_obj.seek(0)
         file_bytes = file_obj.read()
-        
+
         logger.info(f"Iniciando extração de texto de {source_name}")
         return _extract_text_from_pdf_impl(file_bytes, source_name)
 
@@ -499,17 +598,17 @@ else:
 def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
     """
     Extrai tabelas de um PDF usando pdfplumber.
-    
+
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO).
-        
+
     Returns:
         Lista de tabelas. Cada tabela é uma lista de linhas,
         e cada linha é uma lista de strings (células).
     """
     file_obj.seek(0)
     all_tables: List[List[List[str]]] = []
-    
+
     try:
         with pdfplumber.open(file_obj) as pdf:
             for page in pdf.pages:
@@ -521,17 +620,17 @@ def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
                     continue
     except Exception as e:
         logger.warning(f"Falha na extração de tabelas: {e}")
-    
+
     return all_tables
 
 
 def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
     """
     Extrai metadados básicos do PDF para auto-detecção de titular/instituição.
-    
+
     Args:
         file_obj: Objeto de arquivo em memória (BytesIO).
-        
+
     Returns:
         Dicionário com metadados disponíveis.
     """
@@ -542,7 +641,7 @@ def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
         "subject": None,
         "pages": 0
     }
-    
+
     try:
         with fitz.open(stream=file_obj.read(), filetype="pdf") as doc:
             metadata["pages"] = len(doc)
@@ -553,5 +652,5 @@ def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
                 metadata["subject"] = meta.get("subject")
     except Exception as e:
         logger.warning(f"Falha ao extrair metadados: {e}")
-    
+
     return metadata

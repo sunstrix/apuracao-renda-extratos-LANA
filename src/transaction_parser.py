@@ -6,8 +6,8 @@ Arquitetura:
 - parse_nubank(): layout "dd MMM yyyy" com ruído de OCR, seções
   Total de entradas/saídas (com ou sem data na linha), classificação
   crédito/débito em camadas (sinal explícito > seção > semântica >
-  revisão manual), fallback posicional para páginas em duas colunas
-  e look-ahead de valor em linha independente (FIX H);
+  revisão manual), fallback posicional para páginas em duas colunas,
+  look-ahead de valor em linha independente e recuperação por seção;
 - parse_itau/bradesco/santander/caixa/bb(): variações do layout dd/mm;
 - parse_generic(): fallback universal.
 
@@ -15,18 +15,28 @@ Fluxo de revisão humana (CCA/CAIXA): transações cujo sinal de
 crédito/débito não pôde ser determinado saem com is_credit=None e
 needs_review=True, para decisão do operador na tela de revisão (app.py).
 
-FIX B (rodada 2): o parser genérico também marca needs_review=True
-quando o sinal é indeterminado.
-FIX H (rodada 4): parser Nubank recupera valores que o OCR imprime em
-linha independente (layout duas colunas), eliminando o descarte
-silencioso de entradas grandes (ex.: +1.360,00).
+FIX B (rodada 2): parser genérico marca needs_review=True quando o sinal
+é indeterminado.
+FIX H (rodada 4): look-ahead de valor em linha independente.
+RODADA 4 (consenso de consultorias DeepSeek/ChatGPT auditado pelo Qwen):
+- FIX M: detector do bloco corrigido para "valoresemr$" (o low_ns não tem
+  espaços; a checagem antiga "valores em r$" NUNCA casava — values_pool
+  nascia morto e todo o fallback de duas colunas era código morto);
+- FIX I: seção com exatamente 1 pending + total inline no cabeçalho →
+  atribuição EXATA do total ao lançamento (recupera +1.360,00 sem
+  adivinhação; total de seção continua sem virar Transaction);
+- FIX J: look-ahead avança em linha desconhecida (não interrompe mais);
+- FIX K: pending não casado → transação needs_review=True (amount=0.0) —
+  FIM do descarte silencioso;
+- FIX L: canário de somatório por seção (esperado do cabeçalho vs apurado)
+  via logger.warning — o total do próprio banco vira teste de integridade.
 """
 import re
 import logging
 import unicodedata
 from dataclasses import dataclass
 from datetime import date
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from dateutil import parser as date_parser
 
@@ -56,7 +66,7 @@ DATE_SHORT_REGEX = r'^(\d{1,2}[\/\.\-]\d{1,2})\b'
 MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])\/\.\-$'
 MONEY_REGEX = r'(?:R\$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
 MONEY_END_REGEX = r'([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\s*$'
-# Valor "sozinho" na linha (usado no look-ahead FIX H e no bloco de valores)
+# Valor "sozinho" na linha (usado no look-ahead FIX H/J e no bloco de valores)
 MONEY_ONLY_REGEX = r'[-+]?\d{1,3}(?:\.\d{3})*,\d{2}'
 
 SKIP_LINE_PREFIXES = (
@@ -235,7 +245,7 @@ def _nu_date_from_line(line: str) -> Optional[date]:
 
 def _is_nu_header_line(line: str, low_ns: str) -> bool:
     """True se a linha é cabeçalho (lançamento/data/seção/resumo) — usado
-    pelo look-ahead do FIX H para não casar valor de outro lançamento."""
+    pelo look-ahead do FIX H/J para não casar valor de outro lançamento."""
     return (
         line.startswith(NU_TX_STARTERS)
         or _nu_date_from_line(line) is not None
@@ -364,17 +374,13 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     """
     Parser do extrato Nubank (OCR): cabeçalhos de data com ruído, seções
     "Total de entradas/saídas" (COM ou SEM data na linha), lançamentos com
-    valor inline e fallback posicional para páginas em duas colunas
-    (bloco "VALORES EM R$"), com guarda de igualdade de contagens.
+    valor inline, look-ahead de valor em linha independente (FIX H/J),
+    recuperação EXATA por seção (FIX I), fallback posicional para o bloco
+    "VALORES EM R$" (FIX M) e rede de segurança sem descarte (FIX K).
 
-    FIX H (rodada 4): recuperação de valor em linha independente.
-    No layout OCR em duas colunas, o valor da transação frequentemente NÃO
-    vem inline na linha da descrição — aparece 1-4 linhas depois (após as
-    linhas de contraparte). Antes, essas descrições iam para "pending" e só
-    sobreviviam se o bloco "VALORES EM R$" casasse exatamente; caso
-    contrário, DESCARTE SILENCIOSO (perda de entradas como "+1.360,00").
-    Agora: look-ahead limitado que pula apenas linhas de contraparte/vazias
-    e interrompe em qualquer novo cabeçalho (impossível casar valor alheio).
+    O valor inline do cabeçalho de seção NUNCA vira Transaction (é o
+    somatório da seção — evita double count); ele alimenta o FIX I
+    (atribuição exata) e o FIX L (canário de integridade).
     """
     lines = [ln.strip() for ln in (text or "").splitlines()]
     n = len(lines)
@@ -388,6 +394,46 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     total_lines = 0
     in_values_block = False
 
+    # --- Estado por seção (FIX I / FIX L, rodada 4) -------------------------
+    section_total_str: Optional[str] = None
+    section_rec: Optional[Dict[str, Any]] = None
+    section_pending: List[dict] = []
+    section_records: List[Dict[str, Any]] = []
+
+    def _flush_section() -> None:
+        """Fecha a seção atual: FIX I (1 pending + total => atribuição exata),
+        devolve os demais pendings ao fallback global (pool + FIX K)."""
+        nonlocal section_pending, section_total_str, section_rec
+
+        # FIX I: exatamente 1 pending E total do cabeçalho capturado =>
+        # atribuição EXATA (total da seção == valor do único lançamento).
+        if len(section_pending) == 1 and section_total_str is not None:
+            item = section_pending.pop(0)
+            is_credit, amount, needs_review = _decide_credit(
+                section_total_str, item["section"], item["desc"])
+            txs.append(Transaction(
+                date=item["date"] or date.today(),
+                description=item["desc"],
+                amount=amount,
+                is_credit=is_credit,
+                bank=bank,
+                source_file=source_file,
+                needs_review=needs_review,
+            ))
+            if section_rec is not None:
+                section_rec["sum"] += abs(amount)
+                section_rec["count"] += 1
+
+        # Demais (0 ou 2+) seguem para o fallback global; guarda a referência
+        # do registro da seção para o canário FIX L pós-pool.
+        for it in section_pending:
+            it["rec"] = section_rec
+        pending.extend(section_pending)
+
+        section_pending = []
+        section_total_str = None
+        section_rec = None
+
     i = 0
     while i < n:
         line = lines[i]
@@ -397,7 +443,10 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
         low = _normalize_text(line)
         low_ns = low.replace(" ", "").replace(";", "")
 
-        if "valores em r$" in low_ns:
+        # FIX M (rodada 4): low_ns NÃO tem espaços — a checagem antiga
+        # "valores em r$" (com espaço) jamais casava e o values_pool nascia
+        # morto. Corrigido para "valoresemr$".
+        if "valoresemr$" in low_ns:
             in_values_block = True
             continue
 
@@ -414,18 +463,29 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             continue
 
         # Cabeçalho de seção "Total de entradas/saídas", COM ou SEM data.
-        # NOTA: o valor inline do total (ex.: "+1.360,00") é INTENCIONALMENTE
-        # ignorado aqui — é o somatório da seção, não um lançamento (evita
-        # double count).
         is_total_e = "totaldeentradas" in low_ns
         is_total_s = "totaldesaidas" in low_ns
         d = _nu_date_from_line(line)
 
         if is_total_e or is_total_s:
+            _flush_section()  # fecha a seção anterior antes de abrir a nova
             total_lines += 1
             if d is not None:
                 current_date = d
             section = "E" if is_total_e else "S"
+            # FIX I/L: captura o total inline do cabeçalho SOMENTE para
+            # validação/atribuição exata — NUNCA vira Transaction aqui.
+            mt = re.search(MONEY_END_REGEX, line)
+            section_total_str = mt.group(1) if mt else None
+            section_rec = {
+                "label": section,
+                "date": current_date,
+                "expected": (abs(parse_money_value(section_total_str))
+                             if section_total_str else None),
+                "sum": 0.0,
+                "count": 0,
+            }
+            section_records.append(section_rec)
             continue
 
         if d is not None:
@@ -436,8 +496,10 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             amount_str: Optional[str] = m.group(1) if m else None
             consumed_idx = -1
 
-            # FIX H (rodada 4): sem valor inline, procura o valor nas até 4
-            # linhas seguintes, pulando SOMENTE linhas de contraparte/vazias.
+            # FIX H/J (rodada 4): sem valor inline, procura o valor nas até 4
+            # linhas seguintes, pulando linhas de contraparte/vazias/
+            # desconhecidas (FIX J: desconhecida AVANÇA em vez de quebrar) e
+            # interrompendo SOMENTE em novo cabeçalho (não casa valor alheio).
             if amount_str is None:
                 j = i
                 while j < min(i + 4, n):
@@ -457,7 +519,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                     if any(h in low_n for h in NU_CONT_HINTS):
                         j += 1  # linha de contraparte: pula e continua
                         continue
-                    break  # linha desconhecida: segurança, interrompe
+                    j += 1  # FIX J: linha desconhecida: avança no limite
                 if consumed_idx >= 0:
                     lines[consumed_idx] = ""  # consome a linha de valor
 
@@ -475,8 +537,12 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 )
                 txs.append(tx)
                 last_tx = tx
+                if section_rec is not None:
+                    section_rec["sum"] += abs(amount)
+                    section_rec["count"] += 1
             else:
-                pending.append({"date": current_date, "desc": line, "section": section})
+                section_pending.append(
+                    {"date": current_date, "desc": line, "section": section})
                 last_tx = None
             continue
 
@@ -486,9 +552,12 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 last_tx.description = f"{last_tx.description} {line}"
             continue
 
-    # Fallback em duas colunas (MANTIDO): casa valores do bloco
-    # "VALORES EM R$" com as descrições sem valor inline, SOMENTE se as
-    # contagens baterem exatamente.
+    # Fecha a última seção aberta.
+    _flush_section()
+
+    # Fallback em duas colunas (MANTIDO, agora funcional via FIX M): casa
+    # valores do bloco "VALORES EM R$" com as descrições sem valor inline,
+    # SOMENTE se as contagens baterem exatamente.
     if pending:
         skip = summary_labels + total_lines
         available = values_pool[skip:]
@@ -504,12 +573,44 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                     source_file=source_file,
                     needs_review=needs_review,
                 ))
+                rec = item.get("rec")
+                if rec is not None:
+                    rec["sum"] += abs(amount)
+                    rec["count"] += 1
         else:
             logger.warning(
                 "Nubank: bloco 'VALORES EM R$' não casado (%d valores vs %d descrições) "
-                "em %s — linhas sem valor inline descartadas por segurança.",
+                "em %s — aplicando rede de segurança FIX K (sem descarte silencioso).",
                 len(available), len(pending), source_file or "PDF",
             )
+            # FIX K (rodada 4): NADA é descartado em silêncio. Pendings não
+            # casados viram transações ⚠️ (amount=0.0, needs_review=True) para
+            # decisão/visibilidade do operador na tela de revisão.
+            for item in pending:
+                txs.append(Transaction(
+                    date=item["date"] or date.today(),
+                    description=item["desc"],
+                    amount=0.0,
+                    is_credit=None,
+                    bank=bank,
+                    source_file=source_file,
+                    needs_review=True,
+                ))
+
+    # FIX L (rodada 4): canário de somatório por seção — o total informado
+    # pelo próprio banco no cabeçalho vira teste de integridade do parser.
+    # Somente log, NUNCA altera o fluxo de decisão.
+    for rec in section_records:
+        if rec["expected"] is not None and rec["count"] > 0:
+            if abs(rec["sum"] - rec["expected"]) > 0.01:
+                logger.warning(
+                    "Nubank: seção '%s' de %s inconsistente com o somatório do banco: "
+                    "esperado=%.2f apurado=%.2f (%d lançamento(s)) em %s.",
+                    "entradas" if rec["label"] == "E" else "saídas",
+                    rec["date"].strftime("%d/%m/%Y") if rec["date"] else "??/??/????",
+                    rec["expected"], rec["sum"], rec["count"],
+                    source_file or "PDF",
+                )
 
     txs.sort(key=lambda t: t.date)
     return txs

@@ -14,11 +14,18 @@ Compatibilidade: lê tx.manually_confirmed via getattr — transações sem o
 atributo (fluxos antigos) comportam-se como não-manuais.
 
 RODADA 2:
-- FIX F: seção/linhas de "Rastreabilidade da Revisão Manual" no PDF, Excel e
-  CSV, consumindo a chave "revisao_manual" produzida pelo income_calculator
-  (omitida automaticamente em fluxos antigos sem a chave);
-- FIX G: canário de inconsistência — entrada válida com valor negativo gera
-  logger.error nos três artefatos, sem alterar o fluxo de geração.
+FIX F: seção/linhas de "Rastreabilidade da Revisão Manual" no PDF, Excel e
+CSV, consumindo a chave "revisao_manual" produzida pelo income_calculator
+(omitida automaticamente em fluxos antigos sem a chave);
+FIX G: canário de inconsistência — entrada válida com valor negativo gera
+logger.error nos três artefatos, sem alterar o fluxo de geração.
+
+RODADA GEMINI:
+FIX H: marcador de rastreabilidade da extração via IA — lançamentos com
+extraction_source="gemini" (atributo dinâmico setado pelo
+gemini_extractor) recebem selo "[IA]" no PDF e "🤖" no Excel/CSV
+(Helvetica não possui glifos de emoji, daí a diferença de selo),
++ nota de rodapé e contagem no resumo.
 """
 import io
 import csv
@@ -45,6 +52,12 @@ NOTA_CONFIRMACAO_MANUAL = (
     "* sinal de crédito/débito confirmado manualmente pelo operador"
 )
 
+# FIX H (RODADA GEMINI): nota de rastreabilidade da extração via IA.
+NOTA_EXTRACAO_IA = (
+    "Lançamentos marcados com [IA] (PDF) / 🤖 (Excel/CSV) foram extraídos "
+    "via IA (Gemini) e validados contra os somatórios impressos pelo banco"
+)
+
 def format_currency(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -55,10 +68,13 @@ def _is_manual(tx) -> bool:
     """True se o lançamento foi confirmado manualmente pelo operador."""
     return bool(getattr(tx, "manually_confirmed", False))
 
+def _is_gemini(tx) -> bool:
+    """FIX H: True se o lançamento foi extraído via Gemini (atributo dinâmico)."""
+    return getattr(tx, "extraction_source", "") == "gemini"
+
 def _review_summary(metrics: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     """
     FIX F (rodada 2): rastreabilidade da revisão manual.
-
     Lê a chave "revisao_manual" produzida pelo income_calculator (FIX C).
     Retorna (confirmadas_como_renda, excluidas_ou_pendentes), ou None se a
     chave não existir (compatibilidade retroativa com fluxos antigos).
@@ -74,7 +90,6 @@ def _review_summary(metrics: Dict[str, Any]) -> Optional[Tuple[int, int]]:
 def _canary_negative_valid(tx) -> None:
     """
     FIX G (rodada 2): CANÁRIO de inconsistência de contrato.
-
     Entrada válida com valor negativo indica regressão de parser/calculator
     (contrato do sistema: entrada válida => amount > 0). Apenas loga o erro
     para diagnóstico imediato, SEM alterar o fluxo de geração do artefato.
@@ -206,10 +221,11 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
     story.append(resumo_table)
     story.append(Spacer(1, 1 * cm))
 
-    # --- Detalhamento de Entradas Válidas (com marcador de confirmação manual) ---
+    # --- Detalhamento de Entradas Válidas (marcadores * e [IA]) ---
     story.append(Paragraph("Detalhamento de Entradas Válidas Consideradas", section_title_style))
     valid_txs = metrics.get("entradas_validas", [])
     manual_count = 0
+    ia_count = 0
     if valid_txs:
         detail_data = [[Paragraph("Data", S["head_c"]),
                         Paragraph("Descrição da Entrada", S["head_l"]),
@@ -221,6 +237,10 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
             if _is_manual(tx):
                 desc += " *"
                 manual_count += 1
+            # FIX H (RODADA GEMINI): selo [IA] no PDF (Helvetica não tem emoji).
+            if _is_gemini(tx):
+                desc += " [IA]"
+                ia_count += 1
             detail_data.append([
                 Paragraph(format_date(tx.date), S["cell_c"]),
                 Paragraph(desc, S["cell_l"]),
@@ -234,6 +254,9 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
         if manual_count > 0:
             story.append(Spacer(1, 0.2 * cm))
             story.append(Paragraph(NOTA_CONFIRMACAO_MANUAL, S["note"]))
+        if ia_count > 0:
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph(NOTA_EXTRACAO_IA, S["note"]))
     else:
         story.append(Paragraph("Nenhuma entrada válida encontrada.", subtitle_style))
     story.append(Spacer(1, 1 * cm))
@@ -277,7 +300,9 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
         "extratos fornecidos, excluindo transferências de mesma titularidade, rendimentos de "
         "investimentos e créditos de jogos/apostas, conforme regras de negócio configuradas. "
         "A média de meses completos considera apenas períodos com mais de 20 dias de extrato. "
-        "Lançamentos marcados com '*' tiveram o sinal confirmado manualmente pelo operador."
+        "Lançamentos marcados com '*' tiveram o sinal confirmado manualmente pelo operador. "
+        "Lançamentos marcados com '[IA]' foram extraídos via IA (Gemini) e validados contra "
+        "os somatórios impressos pelo banco."
     )
     story.append(Paragraph(footer_text, footer_style))
 
@@ -297,6 +322,9 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
                    institutions: List[str] = None) -> bytes:
     from openpyxl import Workbook
     wb = Workbook()
+
+    # FIX H: contagem prévia para o resumo (ws1).
+    ia_total = sum(1 for t in metrics.get("entradas_validas", []) if _is_gemini(t))
 
     ws1 = wb.active
     ws1.title = "Resumo_Mensal"
@@ -319,6 +347,9 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     if review is not None:
         ws1.append(["Revisão Manual (confirmados como renda)", review[0]])
         ws1.append(["Revisão Manual (exclusões/pendentes)", review[1]])
+    # FIX H (RODADA GEMINI): contagem de extração via IA no resumo.
+    if ia_total > 0:
+        ws1.append(["Extração via IA (Gemini)", ia_total])
     ws1.column_dimensions["A"].width = 18
     ws1.column_dimensions["B"].width = 22
     ws1.column_dimensions["C"].width = 22
@@ -327,16 +358,24 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     ws2.append(["Data", "Descrição da Entrada", "Valor", "Banco", "Obs."])
     _excel_header_style(ws2, 5)
     manual_any = False
+    ia_any = False
     for tx in metrics.get("entradas_validas", []):
         # FIX G (rodada 2): canário de entrada válida negativa.
         _canary_negative_valid(tx)
         manual = _is_manual(tx)
+        gemini = _is_gemini(tx)
         manual_any = manual_any or manual
+        ia_any = ia_any or gemini
+        # FIX H: selo 🤖 no Excel (Unicode suportado); combina com "*" se ambos.
+        obs = ("*" if manual else "") + ("" if gemini else "")
         ws2.append([format_date(tx.date), tx.description, round(tx.amount, 2),
-                    getattr(tx, "bank", ""), "*" if manual else ""])
+                    getattr(tx, "bank", ""), obs])
     if manual_any:
         ws2.append([])
         ws2.append([NOTA_CONFIRMACAO_MANUAL])
+    if ia_any:
+        ws2.append([])
+        ws2.append([NOTA_EXTRACAO_IA])
     ws2.column_dimensions["A"].width = 12
     ws2.column_dimensions["B"].width = 80
     ws2.column_dimensions["C"].width = 14
@@ -374,21 +413,32 @@ def generate_csv(metrics: Dict[str, Any]) -> bytes:
     if review is not None:
         w.writerow(["REVISÃO MANUAL", "Confirmados como renda", review[0]])
         w.writerow(["REVISÃO MANUAL", "Exclusões/pendentes", review[1]])
+    # FIX H (RODADA GEMINI): contagem de extração via IA no CSV.
+    ia_total = sum(1 for t in metrics.get("entradas_validas", []) if _is_gemini(t))
+    if ia_total > 0:
+        w.writerow(["EXTRAÇÃO VIA IA (GEMINI)", "Lançamentos", ia_total])
     w.writerow([])
     w.writerow(["ENTRADAS VÁLIDAS"])
     w.writerow(["Data", "Descrição da Entrada", "Valor", "Banco", "Obs."])
     manual_any = False
+    ia_any = False
     for tx in metrics.get("entradas_validas", []):
         # FIX G (rodada 2): canário de entrada válida negativa.
         _canary_negative_valid(tx)
         manual = _is_manual(tx)
+        gemini = _is_gemini(tx)
         manual_any = manual_any or manual
+        ia_any = ia_any or gemini
+        obs = ("*" if manual else "") + ("🤖" if gemini else "")
         w.writerow([format_date(tx.date), tx.description,
                     f"{tx.amount:.2f}".replace(".", ","), getattr(tx, "bank", ""),
-                    "*" if manual else ""])
+                    obs])
     if manual_any:
         w.writerow([])
         w.writerow([NOTA_CONFIRMACAO_MANUAL])
+    if ia_any:
+        w.writerow([])
+        w.writerow([NOTA_EXTRACAO_IA])
     w.writerow([])
     w.writerow(["AUDITORIA - EXCLUÍDOS"])
     w.writerow(["Data Ref.", "Descrição Original", "Regra de Exclusão Aplicada", "Valor"])

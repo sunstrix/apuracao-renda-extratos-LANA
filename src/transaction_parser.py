@@ -13,6 +13,11 @@ Arquitetura:
 Fluxo de revisão humana (CCA/CAIXA): transações cujo sinal de
 crédito/débito não pôde ser determinado saem com is_credit=None e
 needs_review=True, para decisão do operador na tela de revisão (app.py).
+
+FIX B (rodada 2): o parser genérico agora também marca needs_review=True
+quando o sinal é indeterminado. Antes, essas linhas saíam com
+needs_review=False e eram rotuladas como "Débito — Automático" na revisão,
+causando exclusão em massa INVISÍVEL (discrepância R$ 3.969 vs R$ 344).
 """
 import re
 import logging
@@ -139,29 +144,29 @@ def _decide_credit(amount_str: str, section: Optional[str], description: str):
     3) fallback semântico por palavras-chave (somente se 1 e 2 ausentes);
     4) indeterminado -> is_credit=None, needs_review=True, valor como veio
        (sem forçar sinal): a decisão final é do operador na tela de revisão.
-    
+
     BUG-2 FIX: Sinal explícito tem prioridade ABSOLUTA sobre seção.
     """
     amount = parse_money_value(amount_str)
-    
+
     # PRIORIDADE 1: Sinal explícito tem precedência absoluta
     if amount_str.startswith("-") or amount_str.startswith("+"):
         # Se já tem sinal explícito, respeite-o SEM aplicar regra de seção
         return (not amount_str.startswith("-")), amount, False
-    
+
     # PRIORIDADE 2: Seção (apenas se NÃO há sinal explícito)
     if section == "E":
         return True, abs(amount), False
     if section == "S":
         return False, -abs(amount), False
-    
+
     # PRIORIDADE 3: Fallback semântico
     sem = _semantic_credit_debit(description)
     if sem is True:
         return True, abs(amount), False
     if sem is False:
         return False, -abs(amount), False
-    
+
     # PRIORIDADE 4: Indeterminado - revisão manual
     return None, amount, True
 
@@ -230,7 +235,14 @@ def _nu_date_from_line(line: str) -> Optional[date]:
 def _parse_generic_lines(text: str, bank: str, source_file: str,
                          use_suffix: bool = False) -> List[Transaction]:
     """Layout clássico: data dd/mm[/aa[aa]] + descrição + valor na mesma linha
-    (ou valor nas até 3 linhas seguintes)."""
+    (ou valor nas até 3 linhas seguintes).
+
+    FIX B (rodada 2): quando o sinal de crédito/débito é indeterminado
+    (is_credit=None), a transação agora sai com needs_review=True para ser
+    exibida como ⚠️ na revisão manual do app.py. Antes saía com
+    needs_review=False e era rotulada "Débito — Automático (fora da renda)",
+    causando exclusão silenciosa e em massa de entradas legítimas.
+    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
@@ -307,13 +319,25 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
             if suffix in ("C", "D"):
                 is_credit = suffix == "C"
 
+        # FIX B (rodada 2): sinal indeterminado => revisão manual obrigatória.
+        needs_review = is_credit is None
+
+        amount = parse_money_value(amount_str)
+        # FIX B2 (rodada 2): consistência de sinal — um crédito JAMAIS pode
+        # ter valor negativo (caso raro de "-" explícito combinado com sufixo
+        # "C" ou palavra de crédito). Não mexemos no sinal de débitos para
+        # preservar o contrato atual do rules_engine/report_generator.
+        if is_credit is True and amount < 0:
+            amount = -amount
+
         transactions.append(Transaction(
             date=parsed_date,
             description=description or "Lançamento",
-            amount=parse_money_value(amount_str),
+            amount=amount,
             is_credit=is_credit,
             bank=bank,
             source_file=source_file,
+            needs_review=needs_review,
         ))
         i = consumed_until + 1
 

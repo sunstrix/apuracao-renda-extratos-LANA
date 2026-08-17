@@ -1,22 +1,22 @@
 """
 Interface principal Streamlit da Apuração de Renda via Extratos PDF.
-
 Fluxo (com revisão humana obrigatória antes da exportação):
-1. upload -> extração (st.status + st.progress) -> parsing por banco;
-2. expander com TODAS as transações brutas (antes das regras);
-3. tabela editável (st.data_editor) de revisão manual:
-   - Sinal Detectado (Crédito / Débito / ⚠️ Indeterminado);
-   - checkbox "Incluir na apuração" (pré-marcado só p/ créditos automáticos);
-   - coluna "Motivo da exclusão (manual)";
-4. botão "Confirmar revisão e gerar relatório" -> calculate_income_metrics()
-   recebendo manual_exclusions / manual_inclusions;
-5. downloads PDF / Excel / CSV habilitados somente após a confirmação.
+upload -> extração (st.status + st.progress) -> parsing por banco;
+expander com TODAS as transações brutas (antes das regras);
+tabela editável (st.data_editor) de revisão manual:
+Sinal Detectado (Crédito / Débito / ⚠️ Indeterminado);
+checkbox "Incluir na apuração" (pré-marcado só p/ créditos automáticos);
+coluna "Motivo da exclusão (manual)";
+botão "Confirmar revisão e gerar relatório" -> calculate_income_metrics()
+recebendo manual_exclusions / manual_inclusions;
+downloads PDF / Excel / CSV habilitados somente após a confirmação.
 """
 import logging
-
+import re
+import os
 import streamlit as st
 import pandas as pd
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.pdf_extractor import extract_text_from_pdf
 from src.bank_detector import detect_bank, bank_display_name
 from src.transaction_parser import parse_statement
@@ -28,20 +28,31 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Apuração de Renda - Extratos PDF", page_icon="📊", layout="wide")
 
+# ---------------------------------------------------------------------------
+# PERF-7: Regex compiladas FORA da função para evitar recompilação a cada chamada
+# ---------------------------------------------------------------------------
+# Palavras-chave para exclusão de candidatos a titular (compilado uma única vez)
+HOLDER_EXCLUSION_KEYWORDS = re.compile(
+    r"(CPF|CNPJ|AGÊNCIA|AGENCIA|CONTA|BANCO|MOVIMENTA|SALDO|EXTRATO|NU\s|VALORES)",
+    re.IGNORECASE
+)
 
 def brl(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
 
 def try_detect_holder_name(text_pages) -> str:
     """
     Detecta o titular no extrato (Nubank/OCR): a linha imediatamente acima
     da linha que contém "CPF" é o nome do titular.
+    
+    PERF-7: Reduzido de 4 para 2 páginas (nome do titular quase sempre está
+    no cabeçalho) e usa regex compilada para melhor performance.
     """
     lines = []
-    for page in (text_pages or [])[:4]:
+    # PERF-7: Apenas as primeiras 2 páginas (ao invés de 4)
+    for page in (text_pages or [])[:2]:
         lines.extend((page or "").splitlines())
-
+    
     for idx, line in enumerate(lines):
         if "CPF" not in line:
             continue
@@ -54,14 +65,44 @@ def try_detect_holder_name(text_pages) -> str:
         if (
             2 <= len(cand.split()) <= 6
             and not any(ch.isdigit() for ch in cand)
-            and not any(k in cand.upper() for k in
-                        ("CPF", "CNPJ", "AGÊNCIA", "AGENCIA", "CONTA", "BANCO",
-                         "MOVIMENTA", "SALDO", "EXTRATO", "NU ", "VALORES"))
+            and not HOLDER_EXCLUSION_KEYWORDS.search(cand)
             and all(w[0].isalpha() for w in cand.split() if w)
         ):
             return cand
     return ""
 
+def _process_single_pdf(uploaded_file):
+    """
+    PERF-5: Função auxiliar para processamento paralelo.
+    
+    Processa um único PDF e retorna os resultados. Esta função é chamada
+    dentro do ThreadPoolExecutor para processamento concorrente.
+    
+    Args:
+        uploaded_file: Objeto de arquivo do Streamlit
+        
+    Returns:
+        Tupla (nome_arquivo, sucesso, transacoes, banco, titular, erro)
+    """
+    try:
+        pages = extract_text_from_pdf(uploaded_file)
+        if not pages or not any(p.strip() for p in pages):
+            return (uploaded_file.name, False, [], None, None, 
+                   f"Arquivo não pôde ser lido (protegido por senha, corrompido ou sem camada de texto)")
+        
+        full_text = "\n".join(pages)
+        bank = detect_bank(full_text)
+        
+        # PERF-7: Detecção de titular otimizada (2 páginas + regex compilada)
+        detected_holder = try_detect_holder_name(pages)
+        
+        txs = parse_statement(full_text, bank=bank, source_file=uploaded_file.name)
+        
+        return (uploaded_file.name, True, txs, bank, detected_holder, None)
+    
+    except Exception as e:
+        logger.error("Erro ao processar %s: %s", uploaded_file.name, e)
+        return (uploaded_file.name, False, [], None, None, str(e))
 
 def build_review_dataframe(raw) -> pd.DataFrame:
     """
@@ -90,14 +131,13 @@ def build_review_dataframe(raw) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-
 def main():
     st.title("📊 Apuração de Renda via Extratos PDF")
     st.write("Anexe múltiplos extratos bancários em PDF para consolidar e gerar o relatório executivo.")
 
     for key, default in (("raw_transactions", None), ("metrics", None),
-                         ("detected_holder", ""), ("institutions", None),
-                         ("reviewed", False)):
+                          ("detected_holder", ""), ("institutions", None),
+                          ("reviewed", False)):
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -111,43 +151,61 @@ def main():
     )
 
     # ------------------------------------------------------------------ #
-    # Etapa 1: extração + parsing (com status/progresso)
+    # Etapa 1: extração + parsing (com status/progresso e PARALELIZAÇÃO)
     # ------------------------------------------------------------------ #
     if st.button("🚀 Processar Extratos", type="primary", disabled=not uploaded_files):
         raw_all = []
         institutions = set()
         detected_holder = holder_input
-
+        
         with st.status("Processando extratos...", expanded=True) as status:
-            progress = st.progress(0.0, text="Iniciando processamento...")
+            progress = st.progress(0.0, text="Iniciando processamento paralelo...")
             total = len(uploaded_files)
-
-            for i, uf in enumerate(uploaded_files):
-                status.update(label=f"Processando {uf.name} ({i + 1}/{total})...")
-                try:
-                    pages = extract_text_from_pdf(uf)
-                    if not pages or not any(p.strip() for p in pages):
-                        st.warning(f"⚠️ O arquivo '{uf.name}' não pôde ser lido "
-                                   f"(protegido por senha, corrompido ou sem camada de texto).")
-                        continue
-
-                    full_text = "\n".join(pages)
-                    bank = detect_bank(full_text)
-                    institutions.add(bank_display_name(bank))
-
-                    if not detected_holder:
-                        detected_holder = try_detect_holder_name(pages)
-
-                    txs = parse_statement(full_text, bank=bank, source_file=uf.name)
-                    status.write(f"✅ {uf.name}: {len(txs)} transações ({bank_display_name(bank)})")
-                    raw_all.extend(txs)
-                except Exception as e:
-                    logger.error("Erro ao processar %s: %s", uf.name, e)
-                    st.error(f"❌ Erro inesperado ao processar '{uf.name}': {e}")
-
-                progress.progress((i + 1) / total,
-                                  text=f"Processando {uf.name} ({i + 1}/{total})")
-
+            
+            # PERF-5: Processamento paralelo com ThreadPoolExecutor
+            # Ryzen 5 5600G tem 6 cores/12 threads - usando 6 workers para
+            # maximizar throughput sem sobrecarregar a memória
+            max_workers = min(6, total)  # Nunca mais workers que arquivos
+            
+            # Dicionário para mapear resultados por nome de arquivo
+            results = {}
+            completed_count = 0
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submete todas as tarefas
+                future_to_file = {
+                    executor.submit(_process_single_pdf, uf): uf 
+                    for uf in uploaded_files
+                }
+                
+                # Processa conforme completam (para atualizar progresso em tempo real)
+                for future in as_completed(future_to_file):
+                    uf = future_to_file[future]
+                    try:
+                        file_name, success, txs, bank, holder, error = future.result()
+                        completed_count += 1
+                        
+                        if success:
+                            raw_all.extend(txs)
+                            institutions.add(bank_display_name(bank))
+                            if not detected_holder and holder:
+                                detected_holder = holder
+                            status.write(f"✅ {file_name}: {len(txs)} transações ({bank_display_name(bank)})")
+                        else:
+                            st.warning(f"⚠️ {file_name}: {error}")
+                            status.write(f"⚠️ {file_name}: {error}")
+                        
+                        # PERF-6: Atualiza progresso conforme cada PDF termina
+                        progress.progress(completed_count / total,
+                                        text=f"Processado {completed_count}/{total} arquivos")
+                        
+                    except Exception as e:
+                        completed_count += 1
+                        logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
+                        st.error(f"❌ Erro inesperado ao processar '{uf.name}': {e}")
+                        progress.progress(completed_count / total,
+                                        text=f"Processado {completed_count}/{total} arquivos")
+            
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
 
@@ -160,10 +218,8 @@ def main():
             del st.session_state["review_df"]
 
     raw = st.session_state.raw_transactions
-
     if raw is None:
         return
-
     if not raw:
         st.error("Nenhuma transação pôde ser extraída dos arquivos fornecidos.")
         return
@@ -220,13 +276,11 @@ def main():
     if st.button("✅ Confirmar revisão e gerar relatório", type="primary"):
         manual_inclusions = set()
         manual_exclusions = {}
-
         for _, row in edited.iterrows():
             idx = int(row["ID"])
             t = raw[idx]
             incluir = bool(row["Incluir na apuração"])
             motivo = str(row["Motivo da exclusão (manual)"] or "").strip()
-
             if t.needs_review:
                 # Decisão explícita do operador sobre linha indeterminada
                 if incluir:
@@ -256,11 +310,9 @@ def main():
     # Etapa 4: resultados + exportações (somente após confirmação)
     # ------------------------------------------------------------------ #
     metrics = st.session_state.metrics
-
     if st.session_state.reviewed and metrics is not None:
         st.divider()
         st.subheader("📈 Prévia dos Resultados")
-
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Geral Apurado", brl(metrics["total_geral"]))
         col2.metric("Média Mensal Geral", brl(metrics["media_mensal_geral"]))
@@ -303,23 +355,24 @@ def main():
 
         st.divider()
         st.subheader("📄 Relatório Executivo e Exportações")
-
         col_pdf, col_xlsx, col_csv = st.columns(3)
+
         with col_pdf:
             pdf_bytes = generate_report(metrics, holder_name, institutions).getvalue()
             st.download_button("📥 Gerar Relatório PDF", data=pdf_bytes,
                                file_name="relatorio_apuracao_renda.pdf",
                                mime="application/pdf", type="primary")
+
         with col_xlsx:
             xlsx_bytes = generate_excel(metrics, holder_name, institutions)
             st.download_button("📥 Baixar Excel", data=xlsx_bytes,
                                file_name="apuracao_renda.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
         with col_csv:
             csv_bytes = generate_csv(metrics)
             st.download_button("📥 Baixar CSV", data=csv_bytes,
                                file_name="apuracao_renda.csv", mime="text/csv")
-
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,11 @@ Arquitetura:
 - A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
   e seleção de idioma via pytesseract.get_languages() quando o diretório
   não é resolvido por filesystem.
+- A3: auto-download do por.traineddata (uma única vez) com cache em
+  ~/.cache/tessdata — elimina a dependência de instalação manual no Windows
+  e iguala o OCR local ao do Cloud (lang='por').
+- DEPRECATION PyMuPDF>=1.24: import via "pymupdf" (alias "fitz" mantido por
+  compatibilidade com o pin >=1.23.0 do requirements.txt).
 """
 import io
 import os
@@ -17,12 +22,19 @@ import re
 import shutil
 import logging
 import platform
+import threading
 import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 
 import pdfplumber
-import fitz  # PyMuPDF
+# DEPRECATION PyMuPDF>=1.24: o módulo de topo "fitz" foi renomeado para
+# "pymupdf". O alias mantém o restante do código intacto; o except cobre
+# PyMuPDF 1.23 (pin mínimo do requirements.txt).
+try:
+    import pymupdf as fitz  # PyMuPDF (nome canônico novo)
+except ImportError:  # PyMuPDF legado (< 1.24)
+    import fitz  # PyMuPDF
 from PIL import Image
 
 # Importação condicional do Streamlit para cache
@@ -119,6 +131,25 @@ TESSDATA_LINUX_CANDIDATES = (
     "/app/tessdata",
 )
 
+# ---------------------------------------------------------------------------
+# A3 — auto-download de traineddata (cache em ~/.cache/tessdata)
+# ---------------------------------------------------------------------------
+# No Windows, a instalação padrão do Tesseract traz apenas eng.traineddata,
+# forçando OCR lang='eng' com qualidade inferior em português (483 lançamentos
+# locais vs 742 no Cloud com 'por'). Para eliminar a dependência de instalação
+# manual, o modelo ausente é baixado UMA única vez do repositório oficial
+# tessdata e cacheado em ~/.cache/tessdata, que então vira TESSDATA_PREFIX
+# (diretório autocontido: por + eng). No Streamlit Cloud o apt (packages.txt)
+# já provê 'por' — o download nunca é acionado lá.
+TESSDATA_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "tessdata")
+
+TESSDATA_DOWNLOAD_URLS = {
+    "por": "https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata",
+    "eng": "https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata",
+}
+
+# Serializa o download entre chamadas concorrentes (ThreadPoolExecutor do app.py).
+_TESSDATA_LOCK = threading.Lock()
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
     """
@@ -142,12 +173,10 @@ def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> No
     except Exception as e:
         logger.warning(f"Falha ao salvar debug de extração: {e}")
 
-
 def _normalize_text(text: str) -> str:
     """Remove acentos e baixa caixa para análise estatística uniforme."""
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower()
-
 
 def _vowel_ratio(text: str) -> float:
     """Proporção de vogais entre as letras do texto (0.0 a 1.0)."""
@@ -156,7 +185,6 @@ def _vowel_ratio(text: str) -> float:
         return 0.0
     vowels = sum(1 for c in letters if c in "aeiou")
     return vowels / len(letters)
-
 
 def _real_word_stats(text: str) -> Tuple[int, int]:
     """
@@ -169,7 +197,6 @@ def _real_word_stats(text: str) -> Tuple[int, int]:
     ]
     hits = sum(1 for t in tokens if t in COMMON_PT_WORDS)
     return hits, len(tokens)
-
 
 def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
     """
@@ -217,7 +244,6 @@ def _looks_like_garbled_text(text: str) -> Tuple[bool, str]:
 
     return True, "texto corrompido: " + " E ".join(reasons)
 
-
 def _pages_readable(pages_text: List[str]) -> bool:
     """
     Verifica se a camada textual extraída é confiável, combinando:
@@ -250,7 +276,6 @@ def _pages_readable(pages_text: List[str]) -> bool:
     logger.info("Gate de legibilidade APROVOU: %s", detail)
     return True
 
-
 def _dir_has_traineddata(path: Optional[str]) -> bool:
     """True se o diretório existe e contém ao menos um .traineddata."""
     if not path or not os.path.isdir(path):
@@ -260,7 +285,6 @@ def _dir_has_traineddata(path: Optional[str]) -> bool:
     except Exception as e:
         logger.warning("Não foi possível listar %s: %s", path, e)
         return False
-
 
 def _resolve_tessdata_dir(exe: str) -> Optional[str]:
     """
@@ -296,6 +320,129 @@ def _resolve_tessdata_dir(exe: str) -> Optional[str]:
             return cand
     return None
 
+def _traineddata_exists(directory: Optional[str], lang: str) -> bool:
+    """A3: True se <directory>/<lang>.traineddata existe no filesystem."""
+    if not directory:
+        return False
+    return os.path.exists(os.path.join(directory, f"{lang}.traineddata"))
+
+def _tessdata_system_candidates(exe: Optional[str]) -> List[str]:
+    """A3: diretórios de sistema que podem conter .traineddata (exclui cache)."""
+    candidates: List[str] = []
+    env_prefix = os.environ.get("TESSDATA_PREFIX")
+    if env_prefix:
+        candidates.append(env_prefix)
+    if exe:
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(exe)), "tessdata")
+        )
+    if platform.system() == "Windows":
+        candidates.append(
+            os.path.join(os.path.dirname(TESSERACT_WINDOWS_PATH), "tessdata")
+        )
+    else:
+        candidates.extend(TESSDATA_LINUX_CANDIDATES)
+    return candidates
+
+def _download_traineddata(lang: str, dest_dir: str) -> bool:
+    """
+    A3: baixa <lang>.traineddata do repositório oficial tessdata para
+    dest_dir, com escrita atômica (.part -> final) para nunca corromper
+    um cache existente. Nunca lança exceção: retorna False em qualquer
+    falha (rede, HTTP, disco).
+    """
+    url = TESSDATA_DOWNLOAD_URLS.get(lang)
+    if not url:
+        return False
+    final_path = os.path.join(dest_dir, f"{lang}.traineddata")
+    part_path = final_path + ".part"
+    try:
+        import urllib.request
+        os.makedirs(dest_dir, exist_ok=True)
+        logger.info("A3: baixando %s.traineddata (uma única vez, ~15 MB)...", lang)
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "apuracao-renda-extratos-LANA"}
+        )
+        with urllib.request.urlopen(request, timeout=300) as response:
+            with open(part_path, "wb") as out:
+                shutil.copyfileobj(response, out)
+        os.replace(part_path, final_path)
+        logger.info("A3: %s.traineddata cacheado em %s", lang, dest_dir)
+        return True
+    except Exception as e:
+        logger.error("A3: falha ao baixar %s.traineddata de %s: %s", lang, url, e)
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
+        return False
+
+def _populate_eng_in_cache(exe: Optional[str]) -> None:
+    """
+    A3: garante eng.traineddata no cache — copia de um diretório de sistema
+    quando disponível (evita download desnecessário), senão baixa.
+    Falha aqui NÃO é fatal: com 'por' no cache o OCR já funciona; o 'eng'
+    só é usado no fallback de último recurso.
+    """
+    if _traineddata_exists(TESSDATA_CACHE_DIR, "eng"):
+        return
+    for cand in _tessdata_system_candidates(exe):
+        src = os.path.join(cand, "eng.traineddata")
+        if os.path.exists(src):
+            try:
+                os.makedirs(TESSDATA_CACHE_DIR, exist_ok=True)
+                shutil.copyfile(
+                    src, os.path.join(TESSDATA_CACHE_DIR, "eng.traineddata")
+                )
+                logger.info("A3: eng.traineddata copiado de %s", cand)
+                return
+            except Exception as e:
+                logger.warning("A3: falha ao copiar eng.traineddata de %s: %s", cand, e)
+    _download_traineddata("eng", TESSDATA_CACHE_DIR)
+
+def _ensure_por_traineddata(exe: Optional[str],
+                            tessdata_dir: Optional[str]) -> Optional[str]:
+    """
+    A3: garante disponibilidade de 'por' para o OCR, baixando o modelo para
+    o cache quando ausente.
+
+    Estratégia (nunca quebra o fluxo — pior caso retorna o diretório original):
+    1. 'por' já presente no diretório resolvido      -> nada a fazer;
+    2. sem diretório resolvido, mas Tesseract reporta 'por' (Linux/apt)
+                                                      -> nada a fazer;
+    3. senão, monta cache autocontido (~/.cache/tessdata):
+       - por: baixa se ausente;
+       - eng: copia de diretório de sistema se disponível, senão baixa
+         (preserva o fallback lang='eng' mesmo com TESSDATA_PREFIX=cache);
+       - retorna o cache se 'por' OK; falha de rede retorna o original
+         (comportamento anterior: eng com log de erro).
+
+    Thread-safe: ThreadPoolExecutor do app.py pode acionar esta função
+    concorrentemente; o lock + double-check evitam download duplicado.
+    """
+    if _traineddata_exists(tessdata_dir, "por"):
+        return tessdata_dir
+
+    if not tessdata_dir:
+        try:
+            import pytesseract
+            if "por" in set(pytesseract.get_languages()):
+                return tessdata_dir  # apt/default compilado já provê 'por'
+        except Exception:
+            pass
+
+    with _TESSDATA_LOCK:
+        # Double-check dentro do lock (threads concorrentes).
+        if _traineddata_exists(TESSDATA_CACHE_DIR, "por"):
+            _populate_eng_in_cache(exe)
+            return TESSDATA_CACHE_DIR
+
+        if not _download_traineddata("por", TESSDATA_CACHE_DIR):
+            return tessdata_dir  # offline/falha: mantém comportamento original
+
+        _populate_eng_in_cache(exe)
+        return TESSDATA_CACHE_DIR
 
 def _ensure_tesseract_cmd() -> Tuple[Optional[str], Optional[str]]:
     """
@@ -306,6 +453,10 @@ def _ensure_tesseract_cmd() -> Tuple[Optional[str], Optional[str]]:
     código setava o prefixo incondicionalmente para <pasta do exe>/tessdata,
     que no Linux vira /usr/bin/tessdata (inexistente) — fazendo a checagem de
     por.traineddata falhar e abortar o OCR mesmo com Tesseract instalado.
+
+    A3: após resolver o diretório, _ensure_por_traineddata() pode substituí-lo
+    pelo cache autocontido (~/.cache/tessdata) quando 'por' estiver ausente
+    (caso típico do Windows), baixando o modelo automaticamente.
 
     Retorna (exe, tessdata_dir); exe=None significa Tesseract ausente.
     """
@@ -327,6 +478,10 @@ def _ensure_tesseract_cmd() -> Tuple[Optional[str], Optional[str]]:
         logger.warning("Não foi possível configurar pytesseract.tesseract_cmd: %s", e)
 
     tessdata_dir = _resolve_tessdata_dir(exe)
+
+    # A3: auto-download do 'por' ausente; pode trocar o diretório pelo cache.
+    tessdata_dir = _ensure_por_traineddata(exe, tessdata_dir)
+
     if tessdata_dir:
         os.environ["TESSDATA_PREFIX"] = tessdata_dir
         logger.info("TESSDATA_PREFIX definido para %s", tessdata_dir)
@@ -337,7 +492,6 @@ def _ensure_tesseract_cmd() -> Tuple[Optional[str], Optional[str]]:
             "Idiomas serão consultados via pytesseract.get_languages()."
         )
     return exe, tessdata_dir
-
 
 def _pick_ocr_lang(tessdata_dir: Optional[str]) -> Optional[str]:
     """
@@ -390,7 +544,6 @@ def _pick_ocr_lang(tessdata_dir: Optional[str]) -> Optional[str]:
     )
     return None
 
-
 def pdf_has_text(file_bytes: bytes) -> bool:
     """
     PERF-3: Detecção rápida de texto vs imagem usando PyMuPDF.
@@ -419,7 +572,6 @@ def pdf_has_text(file_bytes: bytes) -> bool:
         logger.warning(f"Erro ao verificar se PDF tem texto: {e}")
         # Em caso de erro, assume que pode ter texto (conservador)
         return True
-
 
 def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
     """
@@ -461,11 +613,9 @@ def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
 
     return text
 
-
 def _compute_file_hash(file_bytes: bytes) -> str:
     """Computa hash SHA256 do conteúdo do arquivo para cache."""
     return hashlib.sha256(file_bytes).hexdigest()
-
 
 def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str]:
     """
@@ -556,7 +706,6 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
         logger.error(f"Falha crítica na extração via OCR: {e}")
         return []
 
-
 # PERF-2: Cache com @st.cache_data para evitar reprocessamento
 if STREAMLIT_AVAILABLE:
     @st.cache_data
@@ -567,8 +716,9 @@ if STREAMLIT_AVAILABLE:
         PERF-1: Prioridade invertida para fitz (PyMuPDF) > pdfplumber > OCR.
         PERF-2: Cache com @st.cache_data para evitar reprocessamento.
         PERF-3: Detecção inteligente de texto vs imagem antes do OCR.
-        PERF-4: DPI adaptativo para OCR (150 → 200 se qualidade baixa).
+        PERF-4: DPI adaptativo (150 → 200 se qualidade baixa).
         A2: tessdata cross-platform + seleção de idioma robusta.
+        A3: auto-download do por.traineddata (cache ~/.cache/tessdata).
 
         Contrato de retorno mantido: List[str] (uma string por página),
         lista vazia se nada funcionar.
@@ -593,7 +743,6 @@ else:
 
         logger.info(f"Iniciando extração de texto de {source_name}")
         return _extract_text_from_pdf_impl(file_bytes, source_name)
-
 
 def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
     """
@@ -622,7 +771,6 @@ def extract_tables_from_pdf(file_obj: io.BytesIO) -> List[List[List[str]]]:
         logger.warning(f"Falha na extração de tabelas: {e}")
 
     return all_tables
-
 
 def get_pdf_metadata(file_obj: io.BytesIO) -> Dict[str, Any]:
     """

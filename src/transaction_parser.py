@@ -6,7 +6,8 @@ Arquitetura:
 - parse_nubank(): layout "dd MMM yyyy" com ruído de OCR, seções
   Total de entradas/saídas (com ou sem data na linha), classificação
   crédito/débito em camadas (sinal explícito > seção > semântica >
-  revisão manual) e fallback posicional para páginas em duas colunas;
+  revisão manual), fallback posicional para páginas em duas colunas
+  e look-ahead de valor em linha independente (FIX H);
 - parse_itau/bradesco/santander/caixa/bb(): variações do layout dd/mm;
 - parse_generic(): fallback universal.
 
@@ -14,10 +15,11 @@ Fluxo de revisão humana (CCA/CAIXA): transações cujo sinal de
 crédito/débito não pôde ser determinado saem com is_credit=None e
 needs_review=True, para decisão do operador na tela de revisão (app.py).
 
-FIX B (rodada 2): o parser genérico agora também marca needs_review=True
-quando o sinal é indeterminado. Antes, essas linhas saíam com
-needs_review=False e eram rotuladas como "Débito — Automático" na revisão,
-causando exclusão em massa INVISÍVEL (discrepância R$ 3.969 vs R$ 344).
+FIX B (rodada 2): o parser genérico também marca needs_review=True
+quando o sinal é indeterminado.
+FIX H (rodada 4): parser Nubank recupera valores que o OCR imprime em
+linha independente (layout duas colunas), eliminando o descarte
+silencioso de entradas grandes (ex.: +1.360,00).
 """
 import re
 import logging
@@ -54,6 +56,8 @@ DATE_SHORT_REGEX = r'^(\d{1,2}[\/\.\-]\d{1,2})\b'
 MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])\/\.\-$'
 MONEY_REGEX = r'(?:R\$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
 MONEY_END_REGEX = r'([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\s*$'
+# Valor "sozinho" na linha (usado no look-ahead FIX H e no bloco de valores)
+MONEY_ONLY_REGEX = r'[-+]?\d{1,3}(?:\.\d{3})*,\d{2}'
 
 SKIP_LINE_PREFIXES = (
     "SALDO", "EXTRATO", "PERIODO", "PERÍODO", "PAGINA", "PÁGINA",
@@ -229,6 +233,17 @@ def _nu_date_from_line(line: str) -> Optional[date]:
     except ValueError:
         return None
 
+def _is_nu_header_line(line: str, low_ns: str) -> bool:
+    """True se a linha é cabeçalho (lançamento/data/seção/resumo) — usado
+    pelo look-ahead do FIX H para não casar valor de outro lançamento."""
+    return (
+        line.startswith(NU_TX_STARTERS)
+        or _nu_date_from_line(line) is not None
+        or "totaldeentradas" in low_ns
+        or "totaldesaidas" in low_ns
+        or low_ns.startswith(NU_SUMMARY_PREFIXES)
+    )
+
 # ---------------------------------------------------------------------------
 # Parser genérico (fallback universal)
 # ---------------------------------------------------------------------------
@@ -239,9 +254,7 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
 
     FIX B (rodada 2): quando o sinal de crédito/débito é indeterminado
     (is_credit=None), a transação agora sai com needs_review=True para ser
-    exibida como ⚠️ na revisão manual do app.py. Antes saía com
-    needs_review=False e era rotulada "Débito — Automático (fora da renda)",
-    causando exclusão silenciosa e em massa de entradas legítimas.
+    exibida como ⚠️ na revisão manual do app.py.
     """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
@@ -324,9 +337,7 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
 
         amount = parse_money_value(amount_str)
         # FIX B2 (rodada 2): consistência de sinal — um crédito JAMAIS pode
-        # ter valor negativo (caso raro de "-" explícito combinado com sufixo
-        # "C" ou palavra de crédito). Não mexemos no sinal de débitos para
-        # preservar o contrato atual do rules_engine/report_generator.
+        # ter valor negativo. Não mexemos no sinal de débitos.
         if is_credit is True and amount < 0:
             amount = -amount
 
@@ -355,7 +366,18 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     "Total de entradas/saídas" (COM ou SEM data na linha), lançamentos com
     valor inline e fallback posicional para páginas em duas colunas
     (bloco "VALORES EM R$"), com guarda de igualdade de contagens.
+
+    FIX H (rodada 4): recuperação de valor em linha independente.
+    No layout OCR em duas colunas, o valor da transação frequentemente NÃO
+    vem inline na linha da descrição — aparece 1-4 linhas depois (após as
+    linhas de contraparte). Antes, essas descrições iam para "pending" e só
+    sobreviviam se o bloco "VALORES EM R$" casasse exatamente; caso
+    contrário, DESCARTE SILENCIOSO (perda de entradas como "+1.360,00").
+    Agora: look-ahead limitado que pula apenas linhas de contraparte/vazias
+    e interrompe em qualquer novo cabeçalho (impossível casar valor alheio).
     """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    n = len(lines)
     txs: List[Transaction] = []
     current_date: Optional[date] = None
     section: Optional[str] = None
@@ -366,8 +388,10 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     total_lines = 0
     in_values_block = False
 
-    for raw in (text or "").splitlines():
-        line = raw.strip()
+    i = 0
+    while i < n:
+        line = lines[i]
+        i += 1
         if not line:
             continue
         low = _normalize_text(line)
@@ -379,7 +403,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
 
         if in_values_block:
             candidate = line.replace(" ", "")
-            if re.fullmatch(r"[-+]?\d{1,3}(?:\.\d{3})*,\d{2}", candidate):
+            if re.fullmatch(MONEY_ONLY_REGEX, candidate):
                 values_pool.append(candidate)
                 continue
             in_values_block = False
@@ -390,6 +414,9 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             continue
 
         # Cabeçalho de seção "Total de entradas/saídas", COM ou SEM data.
+        # NOTA: o valor inline do total (ex.: "+1.360,00") é INTENCIONALMENTE
+        # ignorado aqui — é o somatório da seção, não um lançamento (evita
+        # double count).
         is_total_e = "totaldeentradas" in low_ns
         is_total_s = "totaldesaidas" in low_ns
         d = _nu_date_from_line(line)
@@ -406,8 +433,35 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
 
         if line.startswith(NU_TX_STARTERS):
             m = re.search(MONEY_END_REGEX, line)
-            if m:
-                amount_str = m.group(1)
+            amount_str: Optional[str] = m.group(1) if m else None
+            consumed_idx = -1
+
+            # FIX H (rodada 4): sem valor inline, procura o valor nas até 4
+            # linhas seguintes, pulando SOMENTE linhas de contraparte/vazias.
+            if amount_str is None:
+                j = i
+                while j < min(i + 4, n):
+                    nxt = lines[j].strip()
+                    if not nxt:
+                        j += 1
+                        continue
+                    cand = nxt.replace(" ", "")
+                    if re.fullmatch(MONEY_ONLY_REGEX, cand):
+                        amount_str = cand
+                        consumed_idx = j
+                        break
+                    low_n = _normalize_text(nxt)
+                    low_n_ns = low_n.replace(" ", "").replace(";", "")
+                    if _is_nu_header_line(nxt, low_n_ns):
+                        break  # novo cabeçalho: não casar valor alheio
+                    if any(h in low_n for h in NU_CONT_HINTS):
+                        j += 1  # linha de contraparte: pula e continua
+                        continue
+                    break  # linha desconhecida: segurança, interrompe
+                if consumed_idx >= 0:
+                    lines[consumed_idx] = ""  # consome a linha de valor
+
+            if amount_str is not None:
                 desc = _clean_description(line, "", amount_str)
                 is_credit, amount, needs_review = _decide_credit(amount_str, section, desc)
                 tx = Transaction(
@@ -432,8 +486,9 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 last_tx.description = f"{last_tx.description} {line}"
             continue
 
-    # Fallback em duas colunas: casa valores do bloco "VALORES EM R$" com as
-    # descrições sem valor inline, SOMENTE se as contagens baterem exatamente.
+    # Fallback em duas colunas (MANTIDO): casa valores do bloco
+    # "VALORES EM R$" com as descrições sem valor inline, SOMENTE se as
+    # contagens baterem exatamente.
     if pending:
         skip = summary_labels + total_lines
         available = values_pool[skip:]

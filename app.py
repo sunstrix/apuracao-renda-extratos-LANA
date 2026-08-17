@@ -12,13 +12,16 @@ botão "Confirmar revisão e gerar relatório" -> calculate_income_metrics()
 recebendo manual_exclusions / manual_inclusions;
 downloads PDF / Excel / CSV habilitados somente após a confirmação.
 
-RODADA 3:
-- H1: aviso ao vivo (antes da confirmação) com a contagem de linhas ⚠️ sem
-  decisão que serão EXCLUÍDAS pelo padrão de segurança "manter segurança";
-- H2: st.spinner na geração dos artefatos (PDF/Excel/CSV);
-- H3: manual_inclusions/manual_exclusions inicializados no session_state;
-- MANUT-1: removidos variável local morta (results) e import os não usado
-  (sem impacto funcional; transparência à regra de preservação).
+RODADA GEMINI (integração híbrida):
+- Toggle "Extração via Gemini (nuvem)" no sidebar — habilitado apenas com
+  GEMINI_API_KEY configurada (.env / secrets do Cloud);
+- Checkbox de CONSENTIMENTO explícito (LGPD): sem ele, nada sai da máquina;
+- Roteamento por arquivo: Gemini primeiro (se autorizado); erro da API ou
+  zero transações => fallback AUTOMÁTICO para o pipeline local;
+- Divergências do gabarito (somatórios do banco vs extração IA) viram
+  banner de aviso após o processamento;
+- Rastreabilidade: transações com extraction_source="gemini" recebem selo
+  🤖 na prévia de resultados.
 """
 import logging
 import re
@@ -30,6 +33,11 @@ from src.bank_detector import detect_bank, bank_display_name
 from src.transaction_parser import parse_statement
 from src.income_calculator import calculate_income_metrics
 from src.report_generator import generate_report, generate_excel, generate_csv
+from src.gemini_extractor import (
+    GeminiExtractionError,
+    extract_transactions_via_gemini,
+    gemini_available,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,7 +47,6 @@ st.set_page_config(page_title="Apuração de Renda - Extratos PDF", page_icon="�
 # ---------------------------------------------------------------------------
 # PERF-7: Regex compiladas FORA da função para evitar recompilação a cada chamada
 # ---------------------------------------------------------------------------
-# Palavras-chave para exclusão de candidatos a titular (compilado uma única vez)
 HOLDER_EXCLUSION_KEYWORDS = re.compile(
     r"(CPF|CNPJ|AGÊNCIA|AGENCIA|CONTA|BANCO|MOVIMENTA|SALDO|EXTRATO|NU\s|VALORES)",
     re.IGNORECASE
@@ -52,12 +59,9 @@ def try_detect_holder_name(text_pages) -> str:
     """
     Detecta o titular no extrato (Nubank/OCR): a linha imediatamente acima
     da linha que contém "CPF" é o nome do titular.
-
-    PERF-7: Reduzido de 4 para 2 páginas (nome do titular quase sempre está
-    no cabeçalho) e usa regex compilada para melhor performance.
+    PERF-7: 2 páginas + regex compilada.
     """
     lines = []
-    # PERF-7: Apenas as primeiras 2 páginas (ao invés de 4)
     for page in (text_pages or [])[:2]:
         lines.extend((page or "").splitlines())
 
@@ -79,38 +83,63 @@ def try_detect_holder_name(text_pages) -> str:
             return cand
     return ""
 
-def _process_single_pdf(uploaded_file):
+def _process_single_pdf(uploaded_file, use_gemini: bool = False):
     """
-    PERF-5: Função auxiliar para processamento paralelo.
+    Processa um único PDF e retorna os resultados.
 
-    Processa um único PDF e retorna os resultados. Esta função é chamada
-    dentro do ThreadPoolExecutor para processamento concorrente.
-
-    Args:
-        uploaded_file: Objeto de arquivo do Streamlit
+    Roteamento (RODADA GEMINI):
+    1) se use_gemini: tenta a API Gemini (PDF nativo, sem OCR local);
+       erro controlado ou 0 transações => cai no passo 2;
+    2) pipeline local determinístico (PyMuPDF/pdfplumber/OCR + parsers).
 
     Returns:
-        Tupla (nome_arquivo, sucesso, transacoes, banco, titular, erro)
+        Tupla (nome, sucesso, transacoes, banco, titular, erro, info_gemini)
+        onde info_gemini = {"used": bool, "mismatches": [divergências]}.
     """
+    info_gemini = {"used": False, "mismatches": []}
+
+    # --- Caminho 1: Gemini (nuvem), somente se autorizado pelo operador ---
+    if use_gemini:
+        try:
+            uploaded_file.seek(0)
+            pdf_bytes = uploaded_file.read()
+            txs, data, mismatches = extract_transactions_via_gemini(
+                pdf_bytes, uploaded_file.name
+            )
+            if txs:
+                holder = (data.get("titular") or "").strip() or None
+                info_gemini["used"] = True
+                info_gemini["mismatches"] = mismatches
+                return (uploaded_file.name, True, txs, "nubank", holder, None,
+                        info_gemini)
+            logger.warning(
+                "Gemini retornou 0 transações para %s; usando fallback local.",
+                uploaded_file.name,
+            )
+        except GeminiExtractionError as ge:
+            logger.warning(
+                "Gemini indisponível/erro em %s (%s); usando fallback local.",
+                uploaded_file.name, ge,
+            )
+
+    # --- Caminho 2: pipeline local determinístico (fallback garantido) ---
     try:
         pages = extract_text_from_pdf(uploaded_file)
         if not pages or not any(p.strip() for p in pages):
             return (uploaded_file.name, False, [], None, None,
-                    "Arquivo não pôde ser lido (protegido por senha, corrompido ou sem camada de texto)")
+                    "Arquivo não pôde ser lido (protegido por senha, corrompido ou sem camada de texto)",
+                    info_gemini)
 
         full_text = "\n".join(pages)
         bank = detect_bank(full_text)
-
-        # PERF-7: Detecção de titular otimizada (2 páginas + regex compilada)
         detected_holder = try_detect_holder_name(pages)
-
         txs = parse_statement(full_text, bank=bank, source_file=uploaded_file.name)
-
-        return (uploaded_file.name, True, txs, bank, detected_holder, None)
+        return (uploaded_file.name, True, txs, bank, detected_holder, None,
+                info_gemini)
 
     except Exception as e:
         logger.error("Erro ao processar %s: %s", uploaded_file.name, e)
-        return (uploaded_file.name, False, [], None, None, str(e))
+        return (uploaded_file.name, False, [], None, None, str(e), info_gemini)
 
 def build_review_dataframe(raw) -> pd.DataFrame:
     """
@@ -143,8 +172,32 @@ def main():
     st.title("📊 Apuração de Renda via Extratos PDF")
     st.write("Anexe múltiplos extratos bancários em PDF para consolidar e gerar o relatório executivo.")
 
-    # H3 (rodada 3): manual_inclusions/manual_exclusions inicializados no
-    # session_state para robustez de reruns.
+    # ------------------------------------------------------------------ #
+    # Configuração de extração (RODADA GEMINI): toggle + consentimento
+    # ------------------------------------------------------------------ #
+    with st.sidebar:
+        st.header("⚙️ Configuração de Extração")
+        gemini_ok = gemini_available()
+        use_gemini_cfg = st.checkbox(
+            "☁️ Extração via Gemini (nuvem)",
+            value=gemini_ok,
+            disabled=not gemini_ok,
+            help="Lê o PDF diretamente na API Gemini (sem OCR local). "
+                 "Sem GEMINI_API_KEY no .env/secrets, o fluxo local é usado.",
+        )
+        consent_gemini = False
+        if use_gemini_cfg:
+            consent_gemini = st.checkbox(
+                "Autorizo o envio destes PDFs à API Gemini "
+                "(dados financeiros sensíveis).",
+                value=False,
+            )
+            if not consent_gemini:
+                st.caption("Sem consentimento, o fluxo local será usado.")
+        use_gemini = use_gemini_cfg and consent_gemini
+        if not gemini_ok:
+            st.caption("Gemini: chave não configurada (.env). Fluxo local ativo.")
+
     for key, default in (("raw_transactions", None), ("metrics", None),
                           ("detected_holder", ""), ("institutions", None),
                           ("reviewed", False),
@@ -168,43 +221,44 @@ def main():
         raw_all = []
         institutions = set()
         detected_holder = holder_input
+        gemini_mismatches = []
+        gemini_used_any = False
 
         with st.status("Processando extratos...", expanded=True) as status:
             progress = st.progress(0.0, text="Iniciando processamento paralelo...")
             total = len(uploaded_files)
-
-            # PERF-5: Processamento paralelo com ThreadPoolExecutor
-            # Ryzen 5 5600G tem 6 cores/12 threads - usando 6 workers para
-            # maximizar throughput sem sobrecarregar a memória
             max_workers = min(6, total)  # Nunca mais workers que arquivos
-
             completed_count = 0
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submete todas as tarefas
                 future_to_file = {
-                    executor.submit(_process_single_pdf, uf): uf
+                    executor.submit(_process_single_pdf, uf, use_gemini): uf
                     for uf in uploaded_files
                 }
 
-                # Processa conforme completam (para atualizar progresso em tempo real)
                 for future in as_completed(future_to_file):
                     uf = future_to_file[future]
                     try:
-                        file_name, success, txs, bank, holder, error = future.result()
+                        (file_name, success, txs, bank, holder, error,
+                         info_gemini) = future.result()
                         completed_count += 1
+
+                        if info_gemini.get("used"):
+                            gemini_used_any = True
+                            gemini_mismatches.extend(info_gemini.get("mismatches", []))
 
                         if success:
                             raw_all.extend(txs)
                             institutions.add(bank_display_name(bank))
                             if not detected_holder and holder:
                                 detected_holder = holder
-                            status.write(f"✅ {file_name}: {len(txs)} transações ({bank_display_name(bank)})")
+                            selo = "🤖 " if info_gemini.get("used") else "✅ "
+                            status.write(f"{selo}{file_name}: {len(txs)} transações "
+                                         f"({bank_display_name(bank)})")
                         else:
                             st.warning(f"⚠️ {file_name}: {error}")
                             status.write(f"⚠️ {file_name}: {error}")
 
-                        # PERF-6: Atualiza progresso conforme cada PDF termina
                         progress.progress(completed_count / total,
                                           text=f"Processado {completed_count}/{total} arquivos")
 
@@ -217,6 +271,13 @@ def main():
 
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
+
+        # Gabarito do banco: divergências detectadas na extração via IA.
+        if gemini_used_any and gemini_mismatches:
+            st.warning(
+                f"⚠️ Gemini: {len(gemini_mismatches)} seção(ões) com somatório divergente "
+                "do total impresso pelo banco. Confira a tabela de auditoria antes de confirmar."
+            )
 
         st.session_state.raw_transactions = raw_all
         st.session_state.institutions = institutions
@@ -282,9 +343,7 @@ def main():
         key="review_editor",
     )
 
-    # H1 (rodada 3): aviso ao vivo com a contagem de linhas ⚠️ sem decisão.
-    # Pelo padrão de segurança "manter segurança", elas serão EXCLUÍDAS e
-    # auditadas — o operador vê a consequência ANTES de confirmar.
+    # H1 (reaplicado): aviso ao vivo com a contagem de linhas ⚠️ sem decisão.
     pendentes = int(
         ((edited["Status"].astype(str).str.startswith("⚠️"))
          & (~edited["Incluir na apuração"])).sum()
@@ -305,7 +364,6 @@ def main():
             incluir = bool(row["Incluir na apuração"])
             motivo = str(row["Motivo da exclusão (manual)"] or "").strip()
             if t.needs_review:
-                # Decisão explícita do operador sobre linha indeterminada
                 if incluir:
                     manual_inclusions.add(idx)
                 else:
@@ -313,10 +371,8 @@ def main():
                         motivo or "Não confirmada como renda pelo operador na revisão"
                     )
             else:
-                # Crédito automático desmarcado = exclusão manual com motivo
                 if (t.is_credit or t.amount > 0) and not incluir:
                     manual_exclusions[idx] = motivo or "Excluída manualmente pelo operador"
-                # Débito automático marcado: ignorado (débito nunca é renda)
 
         st.session_state.manual_inclusions = manual_inclusions
         st.session_state.manual_exclusions = manual_exclusions
@@ -340,6 +396,14 @@ def main():
         col1.metric("Total Geral Apurado", brl(metrics["total_geral"]))
         col2.metric("Média Mensal Geral", brl(metrics["media_mensal_geral"]))
         col3.metric("Média Meses Completos", brl(metrics["media_meses_completos"]))
+
+        # Rastreabilidade IA (RODADA GEMINI)
+        n_gemini = sum(1 for t in raw if getattr(t, "extraction_source", "") == "gemini")
+        if n_gemini:
+            st.caption(
+                f"🤖 {n_gemini} lançamento(s) extraído(s) via IA (Gemini), validados "
+                "contra os somatórios impressos pelo banco."
+            )
 
         revisao = metrics.get("revisao_manual", {})
         st.caption(
@@ -380,7 +444,6 @@ def main():
         st.subheader("📄 Relatório Executivo e Exportações")
         col_pdf, col_xlsx, col_csv = st.columns(3)
 
-        # H2 (rodada 3): spinners durante a geração dos artefatos.
         with col_pdf:
             with st.spinner("Gerando PDF..."):
                 pdf_bytes = generate_report(metrics, holder_name, institutions).getvalue()

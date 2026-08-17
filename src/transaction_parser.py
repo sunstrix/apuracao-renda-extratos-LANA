@@ -4,9 +4,9 @@ Conversão de texto bruto (OCR/camada textual) em transações.
 Arquitetura:
 - detect_bank() (bank_detector) escolhe o parser específico;
 - parse_nubank(): layout "dd MMM yyyy" com ruído de OCR, seções
-  Total de entradas/saídas, bloco "VALORES EM R$" e classificação
+  Total de entradas/saídas (com ou sem data na linha), classificação
   crédito/débito em camadas (sinal explícito > seção > semântica >
-  revisão manual);
+  revisão manual) e fallback posicional para páginas em duas colunas;
 - parse_itau/bradesco/santander/caixa/bb(): variações do layout dd/mm;
 - parse_generic(): fallback universal.
 
@@ -142,7 +142,7 @@ def _decide_credit(amount_str: str, section: Optional[str], description: str):
     Decide (is_credit, amount, needs_review) em camadas:
     1) sinal explícito "+"/"-";
     2) seção rastreada (Total de entradas = E / Total de saídas = S);
-    3) fallback semântico por palavras-chave;
+    3) fallback semântico por palavras-chave (somente se 1 e 2 ausentes);
     4) indeterminado -> is_credit=None, needs_review=True, valor como veio
        (sem forçar sinal): a decisão final é do operador na tela de revisão.
     """
@@ -330,7 +330,7 @@ def parse_generic(text: str, bank: str = "generic", source_file: str = "") -> Li
 def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List[Transaction]:
     """
     Parser do extrato Nubank (OCR): cabeçalhos de data com ruído, seções
-    "Total de entradas/saídas" (com OU sem data na linha), lançamentos com
+    "Total de entradas/saídas" (COM ou SEM data na linha), lançamentos com
     valor inline e fallback posicional para páginas em duas colunas
     (bloco "VALORES EM R$"), com guarda de igualdade de contagens.
     """
@@ -362,23 +362,21 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 continue
             in_values_block = False
 
-        # Linhas de resumo (saldo inicial/rendimento/saldo final): não viram
-        # transação; contam apenas no casamento de colunas.
+        # Linhas de resumo (saldo inicial/rendimento/saldo final)
         if low.startswith(NU_SUMMARY_PREFIXES):
             summary_labels += 1
             continue
 
-        # Cabeçalho de seção: "Total de entradas/saídas" COM ou SEM data,
-        # reaproveitando current_date já rastreado (TAREFA 1.4).
-        is_total_entries = "totaldeentradas" in low_ns
-        is_total_saidas = "totaldesaidas" in low_ns
+        # Cabeçalho de seção "Total de entradas/saídas", COM ou SEM data.
+        is_total_e = "totaldeentradas" in low_ns
+        is_total_s = "totaldesaidas" in low_ns
         d = _nu_date_from_line(line)
 
-        if is_total_entries or is_total_saidas:
+        if is_total_e or is_total_s:
             total_lines += 1
             if d is not None:
                 current_date = d
-            section = "E" if is_total_entries else "S"
+            section = "E" if is_total_e else "S"
             continue
 
         if d is not None:

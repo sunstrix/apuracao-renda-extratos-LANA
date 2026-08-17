@@ -4,32 +4,24 @@ Conversão de texto bruto (OCR/camada textual) em transações.
 Arquitetura:
 - detect_bank() (bank_detector) escolhe o parser específico;
 - parse_nubank(): layout "dd MMM yyyy" com ruído de OCR, seções
-  Total de entradas/saídas (com ou sem data na linha), classificação
-  crédito/débito em camadas (sinal explícito > seção > semântica >
-  revisão manual), fallback posicional para páginas em duas colunas,
-  look-ahead de valor em linha independente e recuperação por seção;
+  Total de entradas/saídas, classificação crédito/débito em camadas,
+  look-ahead de valor inline (FIX H/J) e ALINHAMENTO POSICIONAL POR
+  PÁGINA com o bloco "VALORES EM R$" (FIX N, rodada 5);
 - parse_itau/bradesco/santander/caixa/bb(): variações do layout dd/mm;
 - parse_generic(): fallback universal.
 
-Fluxo de revisão humana (CCA/CAIXA): transações cujo sinal de
-crédito/débito não pôde ser determinado saem com is_credit=None e
-needs_review=True, para decisão do operador na tela de revisão (app.py).
-
-FIX B (rodada 2): parser genérico marca needs_review=True quando o sinal
-é indeterminado.
-FIX H (rodada 4): look-ahead de valor em linha independente.
-RODADA 4 (consenso de consultorias DeepSeek/ChatGPT auditado pelo Qwen):
-- FIX M: detector do bloco corrigido para "valoresemr$" (o low_ns não tem
-  espaços; a checagem antiga "valores em r$" NUNCA casava — values_pool
-  nascia morto e todo o fallback de duas colunas era código morto);
-- FIX I: seção com exatamente 1 pending + total inline no cabeçalho →
-  atribuição EXATA do total ao lançamento (recupera +1.360,00 sem
-  adivinhação; total de seção continua sem virar Transaction);
-- FIX J: look-ahead avança em linha desconhecida (não interrompe mais);
-- FIX K: pending não casado → transação needs_review=True (amount=0.0) —
-  FIM do descarte silencioso;
-- FIX L: canário de somatório por seção (esperado do cabeçalho vs apurado)
-  via logger.warning — o total do próprio banco vira teste de integridade.
+RODADA 5 (evidência: debug_extracao_*.txt + logs de execução):
+- FIX N: o bloco "VALORES EM R$" de cada página espelha, EM ORDEM, as
+  linhas "portadoras de valor" da coluna esquerda (totais de seção
+  intercalados com lançamentos). O alinhamento agora é feito POR PÁGINA
+  (flush quando o bloco termina), com skip = valores excedentes à
+  esquerda (resumo/preview) e casamento 1:1 na ordem. A guarda global
+  antiga de contagens é mantida APENAS como fallback para documentos
+  sem bloco por página.
+- FIX O: após o casamento, cada seção é conferida contra o próprio
+  total informado pelo banco; residual (OCR que perdeu descrição) vira
+  linha ⚠️ needs_review explícita — o somatório do banco é a fonte de
+  verdade e nada some em silêncio.
 """
 import re
 import logging
@@ -66,7 +58,6 @@ DATE_SHORT_REGEX = r'^(\d{1,2}[\/\.\-]\d{1,2})\b'
 MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])\/\.\-$'
 MONEY_REGEX = r'(?:R\$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
 MONEY_END_REGEX = r'([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\s*$'
-# Valor "sozinho" na linha (usado no look-ahead FIX H/J e no bloco de valores)
 MONEY_ONLY_REGEX = r'[-+]?\d{1,3}(?:\.\d{3})*,\d{2}'
 
 SKIP_LINE_PREFIXES = (
@@ -89,25 +80,14 @@ NU_CONT_HINTS = (
     "itaú", "itau", "cora", "btg", "amazonia", "efí", "efi",
 )
 NU_DATE_HDR_RE = re.compile(r'(\d{1,3})\s*([A-Za-z]{3,9})\.?\s*Z?\s*(\d{4})')
-
-# Linhas de resumo (não são lançamento nem cabeçalho de seção)
 NU_SUMMARY_PREFIXES = ("saldo inicial", "rendimento", "saldo final")
 
-# Fallback semântico de crédito/débito (aplicado somente quando não há sinal
-# explícito "+"/"-" e a seção (Total de entradas/saídas) é desconhecida).
-# CRÉDITO verificado ANTES do débito para cobrir casos como
-# "Estorno - Compra no débito via Uber" (é entrada, apesar de citar débito).
 NU_CREDIT_HINTS = (
     "transferencia recebida",
     "reembolso recebido",
     "deposito de emprestimo",
     "estorno",
 )
-# DÉBITO. "resgate de emprestimo" confirmado como SAÍDA com o extrato real
-# (debug_extracao_b.pdf): o valor compõe o "Total de saídas"
-# (ex.: 22,00 + 15,00 + 30,27 + 55,00 = 122,27 em 19/MAR/2026 e
-# 15,00 + 15,00 + 9,00 + 584,05 + 18,51 = 641,56 em 20-21/JUL/2026),
-# ou seja, é abatimento do empréstimo, não renda.
 NU_DEBIT_HINTS = (
     "compra no debito",
     "transferencia enviada",
@@ -139,10 +119,6 @@ def parse_money_value(text: str) -> float:
         return 0.0
 
 def _semantic_credit_debit(description: str) -> Optional[bool]:
-    """
-    Fallback semântico baseado em palavras-chave da descrição.
-    Retorna True (crédito), False (débito) ou None (indeterminado).
-    """
     low = _normalize_text(description)
     if any(h in low for h in NU_CREDIT_HINTS):
         return True
@@ -153,35 +129,20 @@ def _semantic_credit_debit(description: str) -> Optional[bool]:
 def _decide_credit(amount_str: str, section: Optional[str], description: str):
     """
     Decide (is_credit, amount, needs_review) em camadas:
-    1) sinal explícito "+"/"-";
-    2) seção rastreada (Total de entradas = E / Total de saídas = S);
-    3) fallback semântico por palavras-chave (somente se 1 e 2 ausentes);
-    4) indeterminado -> is_credit=None, needs_review=True, valor como veio
-       (sem forçar sinal): a decisão final é do operador na tela de revisão.
-
-    BUG-2 FIX: Sinal explícito tem prioridade ABSOLUTA sobre seção.
+    1) sinal explícito "+"/"-"; 2) seção (E/S); 3) semântica; 4) revisão.
     """
     amount = parse_money_value(amount_str)
-
-    # PRIORIDADE 1: Sinal explícito tem precedência absoluta
     if amount_str.startswith("-") or amount_str.startswith("+"):
-        # Se já tem sinal explícito, respeite-o SEM aplicar regra de seção
         return (not amount_str.startswith("-")), amount, False
-
-    # PRIORIDADE 2: Seção (apenas se NÃO há sinal explícito)
     if section == "E":
         return True, abs(amount), False
     if section == "S":
         return False, -abs(amount), False
-
-    # PRIORIDADE 3: Fallback semântico
     sem = _semantic_credit_debit(description)
     if sem is True:
         return True, abs(amount), False
     if sem is False:
         return False, -abs(amount), False
-
-    # PRIORIDADE 4: Indeterminado - revisão manual
     return None, amount, True
 
 def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
@@ -244,8 +205,7 @@ def _nu_date_from_line(line: str) -> Optional[date]:
         return None
 
 def _is_nu_header_line(line: str, low_ns: str) -> bool:
-    """True se a linha é cabeçalho (lançamento/data/seção/resumo) — usado
-    pelo look-ahead do FIX H/J para não casar valor de outro lançamento."""
+    """True se a linha é cabeçalho (lançamento/data/seção/resumo)."""
     return (
         line.startswith(NU_TX_STARTERS)
         or _nu_date_from_line(line) is not None
@@ -259,13 +219,9 @@ def _is_nu_header_line(line: str, low_ns: str) -> bool:
 # ---------------------------------------------------------------------------
 def _parse_generic_lines(text: str, bank: str, source_file: str,
                          use_suffix: bool = False) -> List[Transaction]:
-    """Layout clássico: data dd/mm[/aa[aa]] + descrição + valor na mesma linha
-    (ou valor nas até 3 linhas seguintes).
-
-    FIX B (rodada 2): quando o sinal de crédito/débito é indeterminado
-    (is_credit=None), a transação agora sai com needs_review=True para ser
-    exibida como ⚠️ na revisão manual do app.py.
-    """
+    """Layout clássico: data dd/mm + descrição + valor na mesma linha
+    (ou valor nas até 3 linhas seguintes). FIX B: indeterminado =>
+    needs_review=True."""
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
@@ -342,12 +298,8 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
             if suffix in ("C", "D"):
                 is_credit = suffix == "C"
 
-        # FIX B (rodada 2): sinal indeterminado => revisão manual obrigatória.
         needs_review = is_credit is None
-
         amount = parse_money_value(amount_str)
-        # FIX B2 (rodada 2): consistência de sinal — um crédito JAMAIS pode
-        # ter valor negativo. Não mexemos no sinal de débitos.
         if is_credit is True and amount < 0:
             amount = -amount
 
@@ -372,15 +324,20 @@ def parse_generic(text: str, bank: str = "generic", source_file: str = "") -> Li
 # ---------------------------------------------------------------------------
 def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List[Transaction]:
     """
-    Parser do extrato Nubank (OCR): cabeçalhos de data com ruído, seções
-    "Total de entradas/saídas" (COM ou SEM data na linha), lançamentos com
-    valor inline, look-ahead de valor em linha independente (FIX H/J),
-    recuperação EXATA por seção (FIX I), fallback posicional para o bloco
-    "VALORES EM R$" (FIX M) e rede de segurança sem descarte (FIX K).
+    Parser do extrato Nubank (OCR).
 
-    O valor inline do cabeçalho de seção NUNCA vira Transaction (é o
-    somatório da seção — evita double count); ele alimenta o FIX I
-    (atribuição exata) e o FIX L (canário de integridade).
+    RODADA 5 — FIX N (alinhamento posicional por página): o bloco
+    "VALORES EM R$" de cada página espelha, em ordem, as linhas portadoras
+    de valor da coluna esquerda (totais de seção INTERCALADOS com valores
+    de lançamentos). O flush do alinhamento ocorre quando o bloco termina
+    (linha não-valor após valores) ou no fim do texto — contenção por
+    página, sem vazamento entre páginas.
+
+    FIX O: cada seção é conferida contra o total informado pelo banco;
+    residual vira linha ⚠️ needs_review (nada some em silêncio).
+
+    Mantidos: look-ahead inline (H/J), fallback global antigo (somente para
+    documentos SEM bloco por página), rede FIX K e canário FIX L.
     """
     lines = [ln.strip() for ln in (text or "").splitlines()]
     n = len(lines)
@@ -388,51 +345,138 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     current_date: Optional[date] = None
     section: Optional[str] = None
     last_tx: Optional[Transaction] = None
-    pending: List[dict] = []
-    values_pool: List[str] = []
     summary_labels = 0
     total_lines = 0
     in_values_block = False
 
-    # --- Estado por seção (FIX I / FIX L, rodada 4) -------------------------
-    section_total_str: Optional[str] = None
-    section_rec: Optional[Dict[str, Any]] = None
-    section_pending: List[dict] = []
+    # Fallback global (rodadas anteriores) — só alimenta docs sem bloco/página
+    pending: List[dict] = []
+    values_pool: List[str] = []
+
+    # --- estado por página (FIX N) ---
+    page_slots: List[Dict[str, Any]] = []
+    page_values: List[str] = []
+    page_had_block = False
+
     section_records: List[Dict[str, Any]] = []
+    section_rec: Optional[Dict[str, Any]] = None
 
-    def _flush_section() -> None:
-        """Fecha a seção atual: FIX I (1 pending + total => atribuição exata),
-        devolve os demais pendings ao fallback global (pool + FIX K)."""
-        nonlocal section_pending, section_total_str, section_rec
+    def _make_tx(val_str: str, sec: Optional[str], desc: str,
+                 dte: Optional[date]) -> Transaction:
+        is_credit, amount, needs_review = _decide_credit(val_str, sec, desc)
+        tx = Transaction(
+            date=dte or date.today(), description=desc, amount=amount,
+            is_credit=is_credit, bank=bank, source_file=source_file,
+            needs_review=needs_review,
+        )
+        txs.append(tx)
+        return tx
 
-        # FIX I: exatamente 1 pending E total do cabeçalho capturado =>
-        # atribuição EXATA (total da seção == valor do único lançamento).
-        if len(section_pending) == 1 and section_total_str is not None:
-            item = section_pending.pop(0)
-            is_credit, amount, needs_review = _decide_credit(
-                section_total_str, item["section"], item["desc"])
+    def _credit_rec(rec: Optional[Dict[str, Any]], amount: float) -> None:
+        if rec is not None:
+            rec["sum"] += abs(amount)
+            rec["count"] += 1
+
+    def _fix_k(item: Dict[str, Any]) -> None:
+        txs.append(Transaction(
+            date=item["date"] or date.today(), description=item["desc"],
+            amount=0.0, is_credit=None, bank=bank,
+            source_file=source_file, needs_review=True,
+        ))
+
+    def _close_section_residual(rec: Optional[Dict[str, Any]],
+                                sec_label: Optional[str],
+                                sec_date: Optional[date]) -> None:
+        """FIX O: confere a seção contra o total do banco; residual vira ⚠️."""
+        if rec is None or rec.get("expected") is None:
+            return
+        resid = rec["expected"] - rec["sum"]
+        if abs(resid) > 0.01:
+            logger.warning(
+                "Nubank: seção '%s' de %s com residual de %.2f (OCR perdeu "
+                "descrição); criando linha de revisão. (%s)",
+                "entradas" if sec_label == "E" else "saídas",
+                sec_date.strftime("%d/%m/%Y") if sec_date else "??/??/????",
+                resid, source_file or "PDF",
+            )
+            sign = 1 if sec_label == "E" else -1
             txs.append(Transaction(
-                date=item["date"] or date.today(),
-                description=item["desc"],
-                amount=amount,
-                is_credit=is_credit,
-                bank=bank,
-                source_file=source_file,
-                needs_review=needs_review,
+                date=sec_date or date.today(),
+                description="Residual de seção não recuperado pelo OCR",
+                amount=sign * abs(resid),
+                is_credit=(sec_label == "E"),
+                bank=bank, source_file=source_file, needs_review=True,
             ))
-            if section_rec is not None:
-                section_rec["sum"] += abs(amount)
-                section_rec["count"] += 1
+            rec["sum"] += abs(resid)
 
-        # Demais (0 ou 2+) seguem para o fallback global; guarda a referência
-        # do registro da seção para o canário FIX L pós-pool.
-        for it in section_pending:
-            it["rec"] = section_rec
-        pending.extend(section_pending)
+    def _flush_page() -> None:
+        nonlocal page_slots, page_values, page_had_block
+        if not page_slots and not page_values:
+            page_had_block = False
+            return
 
-        section_pending = []
-        section_total_str = None
-        section_rec = None
+        if not page_had_block:
+            # Sem bloco na página: FIX I (seção 1:1 com total inline) e o
+            # restante vai para o fallback global antigo.
+            run: List[Dict[str, Any]] = []
+            last_hdr: Optional[Dict[str, Any]] = None
+
+            def close_run() -> None:
+                nonlocal run
+                if len(run) == 1 and last_hdr is not None and last_hdr.get("total_str"):
+                    it = run[0]
+                    tx = _make_tx(last_hdr["total_str"], it["section"],
+                                  it["desc"], it["date"])
+                    _credit_rec(last_hdr["rec"], tx.amount)
+                else:
+                    pending.extend(run)
+                run = []
+
+            for sl in page_slots:
+                if sl["kind"] == "header":
+                    close_run()
+                    last_hdr = sl
+                else:
+                    run.append(sl)
+            close_run()
+        else:
+            slots = page_slots
+            vals = page_values
+            skip = max(0, len(vals) - len(slots))
+            paired = vals[skip:]
+            if len(paired) >= len(slots) and slots:
+                cur_rec: Optional[Dict[str, Any]] = None
+                cur_label: Optional[str] = None
+                cur_date: Optional[date] = None
+                vi = 0
+                for sl in slots:
+                    if vi >= len(paired):
+                        break
+                    val = paired[vi]
+                    vi += 1
+                    if sl["kind"] == "header":
+                        _close_section_residual(cur_rec, cur_label, cur_date)
+                        cur_rec = sl["rec"]
+                        cur_rec["expected"] = abs(parse_money_value(val))
+                        cur_label = sl["section"]
+                        cur_date = sl["date"]
+                    else:
+                        tx = _make_tx(val, sl["section"], sl["desc"], sl["date"])
+                        _credit_rec(sl["rec"], tx.amount)
+                _close_section_residual(cur_rec, cur_label, cur_date)
+            else:
+                logger.warning(
+                    "Nubank: alinhamento por página impossível (%d valores vs "
+                    "%d slots) em %s — aplicando FIX K.",
+                    len(vals), len(slots), source_file or "PDF",
+                )
+                for sl in slots:
+                    if sl["kind"] == "tx":
+                        _fix_k(sl)
+
+        page_slots = []
+        page_values = []
+        page_had_block = False
 
     i = 0
     while i < n:
@@ -443,49 +487,48 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
         low = _normalize_text(line)
         low_ns = low.replace(" ", "").replace(";", "")
 
-        # FIX M (rodada 4): low_ns NÃO tem espaços — a checagem antiga
-        # "valores em r$" (com espaço) jamais casava e o values_pool nascia
-        # morto. Corrigido para "valoresemr$".
+        # FIX M: low_ns não tem espaços — checagem sem espaço.
         if "valoresemr$" in low_ns:
             in_values_block = True
+            page_had_block = True
             continue
 
         if in_values_block:
             candidate = line.replace(" ", "")
             if re.fullmatch(MONEY_ONLY_REGEX, candidate):
+                page_values.append(candidate)
                 values_pool.append(candidate)
                 continue
             in_values_block = False
+            _flush_page()  # fim do bloco => fim lógico da página
 
-        # Linhas de resumo (saldo inicial/rendimento/saldo final)
         if low.startswith(NU_SUMMARY_PREFIXES):
             summary_labels += 1
             continue
 
-        # Cabeçalho de seção "Total de entradas/saídas", COM ou SEM data.
         is_total_e = "totaldeentradas" in low_ns
         is_total_s = "totaldesaidas" in low_ns
         d = _nu_date_from_line(line)
 
         if is_total_e or is_total_s:
-            _flush_section()  # fecha a seção anterior antes de abrir a nova
             total_lines += 1
             if d is not None:
                 current_date = d
             section = "E" if is_total_e else "S"
-            # FIX I/L: captura o total inline do cabeçalho SOMENTE para
-            # validação/atribuição exata — NUNCA vira Transaction aqui.
             mt = re.search(MONEY_END_REGEX, line)
-            section_total_str = mt.group(1) if mt else None
+            total_str = mt.group(1) if mt else None
             section_rec = {
                 "label": section,
                 "date": current_date,
-                "expected": (abs(parse_money_value(section_total_str))
-                             if section_total_str else None),
+                "expected": (abs(parse_money_value(total_str)) if total_str else None),
                 "sum": 0.0,
                 "count": 0,
             }
             section_records.append(section_rec)
+            page_slots.append({
+                "kind": "header", "rec": section_rec, "section": section,
+                "date": current_date, "total_str": total_str,
+            })
             continue
 
         if d is not None:
@@ -496,10 +539,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             amount_str: Optional[str] = m.group(1) if m else None
             consumed_idx = -1
 
-            # FIX H/J (rodada 4): sem valor inline, procura o valor nas até 4
-            # linhas seguintes, pulando linhas de contraparte/vazias/
-            # desconhecidas (FIX J: desconhecida AVANÇA em vez de quebrar) e
-            # interrompendo SOMENTE em novo cabeçalho (não casa valor alheio).
+            # FIX H/J: look-ahead de valor inline (até 4 linhas).
             if amount_str is None:
                 j = i
                 while j < min(i + 4, n):
@@ -515,97 +555,59 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                     low_n = _normalize_text(nxt)
                     low_n_ns = low_n.replace(" ", "").replace(";", "")
                     if _is_nu_header_line(nxt, low_n_ns):
-                        break  # novo cabeçalho: não casar valor alheio
+                        break
                     if any(h in low_n for h in NU_CONT_HINTS):
-                        j += 1  # linha de contraparte: pula e continua
+                        j += 1
                         continue
-                    j += 1  # FIX J: linha desconhecida: avança no limite
+                    j += 1
                 if consumed_idx >= 0:
-                    lines[consumed_idx] = ""  # consome a linha de valor
+                    lines[consumed_idx] = ""
 
             if amount_str is not None:
                 desc = _clean_description(line, "", amount_str)
-                is_credit, amount, needs_review = _decide_credit(amount_str, section, desc)
-                tx = Transaction(
-                    date=current_date or date.today(),
-                    description=desc,
-                    amount=amount,
-                    is_credit=is_credit,
-                    bank=bank,
-                    source_file=source_file,
-                    needs_review=needs_review,
-                )
-                txs.append(tx)
+                tx = _make_tx(amount_str, section, desc, current_date)
+                _credit_rec(section_rec, tx.amount)
                 last_tx = tx
-                if section_rec is not None:
-                    section_rec["sum"] += abs(amount)
-                    section_rec["count"] += 1
             else:
-                section_pending.append(
-                    {"date": current_date, "desc": line, "section": section})
+                page_slots.append({
+                    "kind": "tx", "rec": section_rec, "section": section,
+                    "date": current_date, "desc": line,
+                })
                 last_tx = None
             continue
 
-        # Continuação (banco/agência/conta da contraparte)
         if last_tx is not None and d is None and any(h in low for h in NU_CONT_HINTS):
             if len(last_tx.description) < 250:
                 last_tx.description = f"{last_tx.description} {line}"
             continue
 
-    # Fecha a última seção aberta.
-    _flush_section()
+    _flush_page()
 
-    # Fallback em duas colunas (MANTIDO, agora funcional via FIX M): casa
-    # valores do bloco "VALORES EM R$" com as descrições sem valor inline,
-    # SOMENTE se as contagens baterem exatamente.
+    # Fallback global antigo (MANTIDO): só relevante para documentos sem
+    # bloco por página, onde pending acumulou e values_pool pode casar.
     if pending:
         skip = summary_labels + total_lines
         available = values_pool[skip:]
         if len(available) == len(pending):
             for item, val in zip(pending, available):
-                is_credit, amount, needs_review = _decide_credit(val, item["section"], item["desc"])
-                txs.append(Transaction(
-                    date=item["date"] or date.today(),
-                    description=item["desc"],
-                    amount=amount,
-                    is_credit=is_credit,
-                    bank=bank,
-                    source_file=source_file,
-                    needs_review=needs_review,
-                ))
-                rec = item.get("rec")
-                if rec is not None:
-                    rec["sum"] += abs(amount)
-                    rec["count"] += 1
+                tx = _make_tx(val, item["section"], item["desc"], item["date"])
+                _credit_rec(item.get("rec"), tx.amount)
         else:
             logger.warning(
-                "Nubank: bloco 'VALORES EM R$' não casado (%d valores vs %d descrições) "
-                "em %s — aplicando rede de segurança FIX K (sem descarte silencioso).",
+                "Nubank: bloco 'VALORES EM R$' não casado (%d valores vs %d "
+                "descrições) em %s — aplicando rede de segurança FIX K.",
                 len(available), len(pending), source_file or "PDF",
             )
-            # FIX K (rodada 4): NADA é descartado em silêncio. Pendings não
-            # casados viram transações ⚠️ (amount=0.0, needs_review=True) para
-            # decisão/visibilidade do operador na tela de revisão.
             for item in pending:
-                txs.append(Transaction(
-                    date=item["date"] or date.today(),
-                    description=item["desc"],
-                    amount=0.0,
-                    is_credit=None,
-                    bank=bank,
-                    source_file=source_file,
-                    needs_review=True,
-                ))
+                _fix_k(item)
 
-    # FIX L (rodada 4): canário de somatório por seção — o total informado
-    # pelo próprio banco no cabeçalho vira teste de integridade do parser.
-    # Somente log, NUNCA altera o fluxo de decisão.
+    # FIX L: canário de somatório por seção (log-only).
     for rec in section_records:
         if rec["expected"] is not None and rec["count"] > 0:
             if abs(rec["sum"] - rec["expected"]) > 0.01:
                 logger.warning(
-                    "Nubank: seção '%s' de %s inconsistente com o somatório do banco: "
-                    "esperado=%.2f apurado=%.2f (%d lançamento(s)) em %s.",
+                    "Nubank: seção '%s' de %s inconsistente com o somatório do "
+                    "banco: esperado=%.2f apurado=%.2f (%d lançamento(s)) em %s.",
                     "entradas" if rec["label"] == "E" else "saídas",
                     rec["date"].strftime("%d/%m/%Y") if rec["date"] else "??/??/????",
                     rec["expected"], rec["sum"], rec["count"],

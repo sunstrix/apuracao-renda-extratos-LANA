@@ -24,9 +24,17 @@ Segurança/privacidade:
 - Falhas (quota, rede, schema) lançam GeminiExtractionError; o app.py
   faz fallback para o pipeline local determinístico.
 
-Limites do free tier (2.5 Flash): 15 RPM / 1.500 req/dia — um batch de
-3 PDFs = 3 chamadas. PDFs contam ~258 tokens/página (34 páginas ≈ 9k
-tokens), muito abaixo do teto de tokens.
+Resiliência de plataforma (rodada atual):
+- F1: default do modelo atualizado para gemini-3.6-flash (a linha 2.0/2.5
+  foi removida para contas novas — 404 NOT_FOUND);
+- F5: cadeia de fallback MODEL_FALLBACK_CHAIN — o modelo configurado é
+  tentado primeiro e, SOMENTE em 404 NOT_FOUND de modelo, o próximo da
+  cadeia é usado automaticamente (protege da próxima depreciação);
+- F4: AFC (automatic function calling) desabilitado no generate_content
+  (não usamos tools; elimina o warning do google_genai.models).
+
+Limites do free tier (Flash): um batch de 3 PDFs = 3 chamadas. PDFs contam
+~258 tokens/página (34 páginas ≈ 9k tokens), muito abaixo do teto.
 """
 import json
 import logging
@@ -48,23 +56,40 @@ try:
 except ImportError:
     pass
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# F1: gemini-2.5-flash foi removido para contas novas (404 NOT_FOUND);
+# o default passa a ser o modelo vigente. O .env/secrets ainda pode
+# sobrescrever via GEMINI_MODEL.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 TOLERANCIA_SOMATORIO = 0.01
 
+# F5 — cadeia de resiliência a depreciação de modelo (ordem = prioridade).
+# Se o modelo configurado for removido pela Google, o próximo da cadeia é
+# tentado automaticamente (apenas em 404 NOT_FOUND de modelo).
+MODEL_FALLBACK_CHAIN = ("gemini-3.6-flash", "gemini-3.5-flash-lite")
 
 class GeminiExtractionError(Exception):
     """Falha controlada da extração via Gemini (o app faz fallback local)."""
-
 
 def get_api_key() -> Optional[str]:
     """Chave vinda exclusivamente do ambiente (.env / secrets)."""
     return (os.getenv("GEMINI_API_KEY") or "").strip() or None
 
-
 def gemini_available() -> bool:
     """True se há chave configurada (não testa quota/rede)."""
     return get_api_key() is not None
 
+def _model_candidates() -> List[str]:
+    """F5: modelo configurado primeiro, depois a cadeia (sem duplicados)."""
+    candidates = [GEMINI_MODEL]
+    for model in MODEL_FALLBACK_CHAIN:
+        if model not in candidates:
+            candidates.append(model)
+    return candidates
+
+def _is_model_not_found(error: Exception) -> bool:
+    """F5: detecta 404 NOT_FOUND 'modelo removido' na exceção do SDK."""
+    text = str(error)
+    return "404" in text and ("NOT_FOUND" in text or "no longer available" in text)
 
 # ---------------------------------------------------------------------------
 # Schema JSON estrito (controlled generation)
@@ -140,9 +165,15 @@ REGRAS OBRIGATÓRIAS:
 9. Responda APENAS o JSON do schema, sem texto extra.
 """
 
-
 def _call_gemini_raw(pdf_bytes: bytes) -> str:
-    """Chama a API com o PDF nativo e retorna o texto JSON cru."""
+    """
+    Chama a API com o PDF nativo e retorna o texto JSON cru.
+
+    F5: tenta os modelos de _model_candidates() em ordem. SOMENTE 404
+    NOT_FOUND de modelo avança para o próximo da cadeia; demais erros
+    (quota, rede, auth, schema) lançam GeminiExtractionError na hora
+    (o app.py faz fallback local).
+    """
     key = get_api_key()
     if not key:
         raise GeminiExtractionError(
@@ -157,24 +188,56 @@ def _call_gemini_raw(pdf_bytes: bytes) -> str:
 
     try:
         client = genai.Client(api_key=key)
-        part = genai.types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-        config = genai.types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=EXTRACTION_SCHEMA,
-        )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[part, EXTRACTION_PROMPT],
-            config=config,
-        )
-        return response.text
-    except GeminiExtractionError:
-        raise
     except Exception as e:
-        # Quota, rede, modelo indisponível etc. — o app faz fallback local.
-        raise GeminiExtractionError(f"Falha na chamada Gemini: {e}") from e
+        raise GeminiExtractionError(f"Falha ao criar client Gemini: {e}") from e
 
+    part = genai.types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+    # F4: desabilita AFC (não usamos tools neste fluxo; elimina o warning
+    # "Direct use of automatic function calling... is not recommended").
+    config_kwargs: Dict[str, Any] = dict(
+        temperature=0.0,
+        response_mime_type="application/json",
+        response_schema=EXTRACTION_SCHEMA,
+    )
+    try:
+        config_kwargs["automatic_function_calling"] = (
+            genai.types.AutomaticFunctionCallingConfig(disable=True)
+        )
+    except Exception:
+        pass  # SDK antigo sem o tipo: mantém comportamento padrão
+
+    config = genai.types.GenerateContentConfig(**config_kwargs)
+
+    candidates = _model_candidates()
+    last_error: Optional[Exception] = None
+    for idx, model in enumerate(candidates):
+        try:
+            logger.info("Gemini: chamando modelo %s (%d/%d)...",
+                        model, idx + 1, len(candidates))
+            response = client.models.generate_content(
+                model=model,
+                contents=[part, EXTRACTION_PROMPT],
+                config=config,
+            )
+            if model != GEMINI_MODEL:
+                logger.warning(
+                    "Gemini: modelo configurado (%s) indisponível; "
+                    "fallback automático usado: %s.", GEMINI_MODEL, model,
+                )
+            return response.text
+        except Exception as e:
+            last_error = e
+            if _is_model_not_found(e) and idx + 1 < len(candidates):
+                logger.warning(
+                    "Gemini: modelo %s removido/indisponível (404 NOT_FOUND); "
+                    "tentando %s.", model, candidates[idx + 1],
+                )
+                continue
+            # Quota, rede, auth, schema etc. — o app faz fallback local.
+            raise GeminiExtractionError(f"Falha na chamada Gemini: {e}") from e
+
+    raise GeminiExtractionError(f"Falha na chamada Gemini: {last_error}")
 
 def _parse_iso_date(value: str):
     """Converte 'yyyy-mm-dd' (preferido) com fallback dayfirst p/ dd/mm/yyyy."""
@@ -183,7 +246,6 @@ def _parse_iso_date(value: str):
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
         return date_parser.parse(value, dayfirst=True).date()
-
 
 def validate_gemini_totals(data: Dict[str, Any],
                            tolerance: float = TOLERANCIA_SOMATORIO
@@ -219,7 +281,6 @@ def validate_gemini_totals(data: Dict[str, Any],
             })
     return mismatches
 
-
 def gemini_data_to_transactions(data: Dict[str, Any],
                                 source_name: str) -> List[Transaction]:
     """
@@ -246,10 +307,9 @@ def gemini_data_to_transactions(data: Dict[str, Any],
         )
         # Rastreabilidade (lido via getattr no report_generator).
         tx.extraction_source = "gemini"
-        txs.append(tx)
+        txs.append(txs and tx or tx)  # noqa: preserve original append semantics
     txs.sort(key=lambda t: t.date)
     return txs
-
 
 def extract_transactions_via_gemini(
     pdf_bytes: bytes,

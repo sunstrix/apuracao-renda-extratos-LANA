@@ -5,9 +5,10 @@ Prioridade de avaliação (da mais alta para a mais baixa):
 1. Exclusão manual pelo operador (tela de revisão) — motivo propagado;
 2. Mesma titularidade detectada pelo NOME do titular na contraparte;
 3. Lançamento de débito (valor negativo);
-4. Regras automáticas por palavras-chave (config/exclusion_keywords.json):
-   mesma titularidade, investimentos/resgates, apostas/jogos.
+4. Regras automáticas por palavras-chave (config/exclusion_keywords.json).
 
+Identificador de exclusão manual: índice da transação na lista bruta
+(mesmo índice exibido/editado no st.data_editor da tela de revisão).
 Compatibilidade retroativa: todos os parâmetros novos são opcionais;
 chamadas antigas evaluate_transaction(tx) continuam idênticas.
 """
@@ -96,6 +97,9 @@ def _holder_matches(holder_name: str, description: str) -> bool:
     Critério anti-falso-positivo:
     - nome completo normalizado presente na descrição, OU
     - pelo menos 2 palavras do nome (com 3+ letras cada) presentes.
+    Ex.: titular "Davi Herculano e Silva" casa com "...Pix DAVI HERCULANO E
+    SILVA - ITAÚ..." (3 palavras), mas NÃO casa com "ELIANE HERCULANO DE
+    ANDRADE" (apenas 1 palavra em comum).
     """
     norm_holder = normalize_text(holder_name)
     norm_desc = normalize_text(description)
@@ -140,12 +144,17 @@ def evaluate_transaction(
         and transaction_index is not None
         and transaction_index in manual_exclusions
     ):
-        motivo = manual_exclusions[transaction_index] or "motivo não informado"
-        return True, f"Excluída manualmente pelo usuário ({motivo})"
+        motivo = (manual_exclusions[transaction_index] or "").strip()
+        if motivo:
+            return True, f"Excluída manualmente pelo usuário ({motivo})"
+        return True, "Excluída manualmente pelo usuário"
 
     # 2) Mesma titularidade pelo nome do titular na contraparte.
     if holder_name and _holder_matches(holder_name, transaction.description):
-        return True, "Transferência de mesma titularidade (nome do titular identificado na contraparte)"
+        return True, (
+            "Transferência de mesma titularidade "
+            "(nome do titular identificado na contraparte)"
+        )
 
     # 3) Débitos nunca são renda.
     if transaction.amount < 0:

@@ -4,8 +4,9 @@ Motor de regras de negócio da apuração de renda.
 Prioridade de avaliação (da mais alta para a mais baixa):
 1. Exclusão manual pelo operador (tela de revisão) — motivo propagado;
 2. Mesma titularidade detectada pelo NOME do titular na contraparte;
-3. Lançamento de débito (valor negativo);
-4. Regras automáticas por palavras-chave (config/exclusion_keywords.json).
+3. Lançamento de débito/compra (is_credit == False) — excluído incondicionalmente;
+4. Lançamento com valor negativo (segurança contra parsers defeituosos);
+5. Regras automáticas por palavras-chave (config/exclusion_keywords.json).
 
 Identificador de exclusão manual: índice da transação na lista bruta
 (mesmo índice exibido/editado no st.data_editor da tela de revisão),
@@ -15,11 +16,16 @@ Compatibilidade retroativa: todos os parâmetros novos são opcionais;
 chamadas antigas evaluate_transaction(tx) continuam idênticas.
 
 RODADA 2:
-- FIX D: CONFIG_PATH agora resolve relativo ao projeto (fallback para o CWD
-  inexistente), eliminando o fallback SILENCIOSO para DEFAULT_KEYWORDS quando
-  o app é executado fora da raiz do repositório;
-- FIX E: canário de inconsistência — crédito com valor negativo gera
-  logger.error (regressão de parser) sem alterar o fluxo de decisão.
+FIX D: CONFIG_PATH agora resolve relativo ao projeto (fallback para o CWD
+inexistente), eliminando o fallback SILENCIOSO para DEFAULT_KEYWORDS quando
+o app é executado fora da raiz do repositório.
+FIX E: canário de inconsistência — crédito com valor negativo gera
+logger.error (regressão de parser) sem alterar o fluxo de decisão.
+
+RODADA 3 (CORREÇÃO CRÍTICA DE REGRAS):
+- Bloqueio explícito de transações com is_credit == False (débitos/compras),
+  garantindo que NENHUM débito entre na apuração, mesmo que o parser tenha
+  atribuído um valor positivo por engano.
 """
 import json
 import os
@@ -81,6 +87,7 @@ DEFAULT_KEYWORDS: Dict[str, List[str]] = {
 # Cache simples do JSON de palavras-chave, invalidado por mtime do arquivo.
 _KEYWORDS_CACHE: Dict[str, object] = {"mtime": None, "data": None}
 
+
 def load_exclusion_keywords() -> Dict[str, List[str]]:
     """
     Carrega as palavras-chave de exclusão do arquivo JSON.
@@ -109,10 +116,12 @@ def load_exclusion_keywords() -> Dict[str, List[str]]:
         logger.error("Erro ao ler arquivo de palavras-chave: %s. Usando fallback.", e)
         return DEFAULT_KEYWORDS
 
+
 def normalize_text(text: str) -> str:
     """Remove acentos e baixa caixa para comparação semântica."""
     nfkd = unicodedata.normalize("NFKD", text or "")
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower().strip()
+
 
 def _holder_tokens(name: str) -> List[str]:
     """
@@ -121,28 +130,39 @@ def _holder_tokens(name: str) -> List[str]:
     """
     return [t for t in re.split(r"[^a-z0-9]+", normalize_text(name)) if len(t) >= 3]
 
+
 def _holder_matches(holder_name: str, description: str) -> bool:
     """
     Verifica se o nome do titular aparece na descrição da contraparte.
-    Critério anti-falso-positivo (exigência da TAREFA 2):
+    
+    Critério (case-insensitive e tolerante a variação de ordem):
     - nome completo normalizado presente na descrição, OU
     - pelo menos 2 tokens de 3+ letras do nome presentes como tokens
       da descrição (casamento por token, não por substring livre).
+      
     Isso exclui "DAVI HERCULANO E SILVA" (3 acertos) mas NÃO exclui
     "ELIANE HERCULANO DE ANDRADE" (apenas 1 acerto: "herculano").
     """
     norm_holder = normalize_text(holder_name)
     norm_desc = normalize_text(description)
+    
     if not norm_holder or not norm_desc:
         return False
+        
+    # Match exato do nome completo normalizado
     if norm_holder in norm_desc:
         return True
+        
+    # Match por tokens significativos (tolerante a ordem e variações)
     holder_words = _holder_tokens(holder_name)
     if len(holder_words) < 2:
         return False
+        
     desc_tokens = set(re.split(r"[^a-z0-9]+", norm_desc))
     hits = sum(1 for w in holder_words if w in desc_tokens)
+    
     return hits >= 2
+
 
 def evaluate_transaction(
     transaction: Transaction,
@@ -177,17 +197,27 @@ def evaluate_transaction(
         return True, "Excluída manualmente pelo usuário"
 
     # 2) Mesma titularidade pelo nome do titular na contraparte.
+    # (Comparação case-insensitive e tolerante a variação de ordem de nome)
     if holder_name and _holder_matches(holder_name, transaction.description):
         return True, (
             "Transferência de mesma titularidade "
             "(nome do titular identificado na contraparte)"
         )
 
+    # 3) CORREÇÃO CRÍTICA: Débitos e compras NUNCA são renda.
+    # Se o parser identificou como débito (is_credit == False), excluímos
+    # INCONDICIONALMENTE, independentemente do valor ou texto da descrição.
+    if transaction.is_credit is False:
+        return True, "Lançamento de débito/compra (não é entrada de renda)"
+
+    # 3b) Segurança: valores negativos também são excluídos (caso is_credit
+    # seja None/True mas o amount tenha sido parseado como negativo).
+    if transaction.amount < 0:
+        return True, "Lançamento com valor negativo (não é entrada de renda)"
+
     # FIX E (rodada 2): CANÁRIO de inconsistência de sinal.
-    # Contrato do sistema (após rodadas B/B2): is_credit=True => amount > 0.
-    # Se esta condição disparar, algum parser REGREDIU e está entregando
-    # crédito negativo — registra erro para diagnóstico imediato, SEM alterar
-    # o fluxo de decisão (a regra 3 abaixo continua tratando o sinal).
+    # Contrato do sistema: is_credit=True => amount > 0.
+    # Se esta condição disparar, algum parser REGREDIU.
     if transaction.is_credit is True and transaction.amount < 0:
         logger.error(
             "INCONSISTÊNCIA DE SINAL: transação marcada como CRÉDITO com valor "
@@ -199,19 +229,18 @@ def evaluate_transaction(
             transaction.source_file or "PDF",
         )
 
-    # 3) Débitos nunca são renda.
-    if transaction.amount < 0:
-        return True, "Lançamento de débito (não é entrada de renda)"
-
-    # 4) Regras automáticas por palavras-chave.
+    # 4) Regras automáticas por palavras-chave (correspondência parcial/substring).
     keywords = load_exclusion_keywords()
     norm = normalize_text(transaction.description)
+    
     for word in keywords.get("same_ownership", []):
         if normalize_text(word) in norm:
-            return True, "Transferência de mesma titularidade"
+            return True, "Transferência de mesma titularidade (palavra-chave)"
+            
     for word in keywords.get("investments", []):
         if normalize_text(word) in norm:
             return True, "Resgate/Rendimento de aplicação financeira"
+            
     for word in keywords.get("gambling", []):
         if normalize_text(word) in norm:
             return True, "Crédito de aposta/jogo de azar"

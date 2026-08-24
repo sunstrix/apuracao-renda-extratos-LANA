@@ -1,20 +1,19 @@
 """
 Extração de texto de PDFs com fallback em camadas e otimizações de performance.
-
 Arquitetura:
-- Detecção inteligente de texto vs imagem (evita OCR desnecessário)
-- Prioridade: fitz (PyMuPDF) > pdfplumber > OCR
-- Gate de legibilidade para detectar texto corrompido
-- Cache com @st.cache_data para evitar reprocessamento
-- DPI adaptativo para OCR (150 → 200 se qualidade baixa)
-- A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
-  e seleção de idioma via pytesseract.get_languages() quando o diretório
-  não é resolvido por filesystem.
-- A3: auto-download do por.traineddata (uma única vez) com cache em
-  ~/.cache/tessdata — elimina a dependência de instalação manual no Windows
-  e iguala o OCR local ao do Cloud (lang='por').
-- DEPRECATION PyMuPDF>=1.24: import via "pymupdf" (alias "fitz" mantido por
-  compatibilidade com o pin >=1.23.0 do requirements.txt).
+Detecção inteligente de texto vs imagem (evita OCR desnecessário)
+Prioridade: fitz (PyMuPDF) > pdfplumber > OCR
+Gate de legibilidade para detectar texto corrompido
+Cache com @st.cache_data para evitar reprocessamento
+DPI adaptativo para OCR (150 → 200 se qualidade baixa)
+A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
+e seleção de idioma via pytesseract.get_languages() quando o diretório
+não é resolvido por filesystem.
+A3: auto-download do por.traineddata (uma única vez) com cache em
+~/.cache/tessdata — elimina a dependência de instalação manual no Windows
+e iguala o OCR local ao do Cloud (lang='por').
+DEPRECATION PyMuPDF>=1.24: import via "pymupdf" (alias "fitz" mantido por
+compatibilidade com o pin >=1.23.0 do requirements.txt).
 """
 import io
 import os
@@ -28,6 +27,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 
 import pdfplumber
+
 # DEPRECATION PyMuPDF>=1.24: o módulo de topo "fitz" foi renomeado para
 # "pymupdf". O alias mantém o restante do código intacto; o except cobre
 # PyMuPDF 1.23 (pin mínimo do requirements.txt).
@@ -35,6 +35,7 @@ try:
     import pymupdf as fitz  # PyMuPDF (nome canônico novo)
 except ImportError:  # PyMuPDF legado (< 1.24)
     import fitz  # PyMuPDF
+
 from PIL import Image
 
 # Importação condicional do Streamlit para cache
@@ -92,14 +93,14 @@ COMMON_PT_WORDS = {
 
 # Calibração conservadora (documentação do raciocínio):
 # - Em texto bancário REAL, as palavras acima representam tipicamente 10-20%
-#   dos tokens alfabéticos; em texto embaralhado, ~0%.
+# dos tokens alfabéticos; em texto embaralhado, ~0%.
 # - REAL_WORD_RATIO_MIN = 5%: metade do piso típico de texto real, para
-#   tolerar OCR ruim ou extratos com vocabulário atípico.
+# tolerar OCR ruim ou extratos com vocabulário atípico.
 # - MIN_REAL_WORD_HITS = 20: exige "algumas dezenas" de ocorrências absolutas,
-#   impedindo que uma página curta com 2 ou 3 acertos casuais passe no gate.
+# impedindo que uma página curta com 2 ou 3 acertos casuais passe no gate.
 # - MIN_ALPHA_TOKENS = 100: piso amostral; abaixo disso a razão não é
-#   estatisticamente confiável e o texto é tratado como corrompido (força o
-#   fallback para a próxima camada, que é o comportamento seguro).
+# estatisticamente confiável e o texto é tratado como corrompido (força o
+# fallback para a próxima camada, que é o comportamento seguro).
 REAL_WORD_RATIO_MIN = 0.05
 MIN_REAL_WORD_HITS = 20
 MIN_ALPHA_TOKENS = 100
@@ -150,6 +151,68 @@ TESSDATA_DOWNLOAD_URLS = {
 
 # Serializa o download entre chamadas concorrentes (ThreadPoolExecutor do app.py).
 _TESSDATA_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# EXTRAÇÃO ORDENADA POR COORDENADAS VISUAIS (CORREÇÃO CRÍTICA)
+# ---------------------------------------------------------------------------
+def _extract_text_ordered_fitz(page) -> str:
+    """
+    Extrai texto do PyMuPDF respeitando a ordem visual (top-to-bottom).
+    Agrupa caracteres por linha (tolerância de Y) e ordena por X.
+    Isso evita que colunas diferentes sejam lidas na mesma linha lógica.
+    """
+    try:
+        # "dict" retorna blocos, linhas e spans com coordenadas precisas
+        blocks = page.get_text("dict")["blocks"]
+        lines_data = []
+        
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    y = line["bbox"][1]  # Coordenada Y do topo da linha
+                    # Concatena os spans da linha
+                    text = "".join([span["text"] for span in line["spans"]])
+                    if text.strip():
+                        lines_data.append((y, text))
+        
+        # Ordena por Y (cima para baixo)
+        lines_data.sort(key=lambda item: item[0])
+        return "\n".join([text for _, text in lines_data])
+    except Exception as e:
+        logger.warning(f"Falha na extração ordenada fitz, usando fallback: {e}")
+        return page.get_text("text", sort=True)
+
+
+def _extract_text_ordered_pdfplumber(page) -> str:
+    """
+    Extrai texto do pdfplumber respeitando a ordem visual (top-to-bottom).
+    Agrupa caracteres por coordenada 'top' (com tolerância) e ordena por 'x0'.
+    """
+    try:
+        chars = page.chars
+        if not chars:
+            return ""
+        
+        # Agrupa caracteres por linha (arredondando 'top' para tolerância de 1pt)
+        lines_dict = {}
+        for char in chars:
+            top = round(char["top"], 1)
+            if top not in lines_dict:
+                lines_dict[top] = []
+            lines_dict[top].append((char["x0"], char["text"]))
+        
+        # Ordena linhas por Y e caracteres dentro da linha por X
+        sorted_lines = []
+        for top in sorted(lines_dict.keys()):
+            line_chars = sorted(lines_dict[top], key=lambda c: c[0])
+            sorted_lines.append("".join([c[1] for c in line_chars]))
+            
+        return "\n".join(sorted_lines)
+    except Exception as e:
+        logger.warning(f"Falha na extração ordenada pdfplumber, usando fallback: {e}")
+        return page.extract_text() or ""
+
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
     """
@@ -645,7 +708,8 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
                 if doc.needs_pass:
                     logger.warning("PDF protegido por senha detectado no PyMuPDF.")
                     return []
-                pages_text = [page.get_text("text") for page in doc]
+                # CORREÇÃO: Usa extração ordenada por coordenadas visuais
+                pages_text = [_extract_text_ordered_fitz(page) for page in doc]
 
             if _pages_readable(pages_text):
                 _dump_debug_text(source_name, pages_text, "pymupdf")
@@ -662,7 +726,8 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
             if getattr(pdf, "is_encrypted", False):
                 logger.warning("PDF protegido por senha detectado.")
                 return []
-            pages_text = [page.extract_text() or "" for page in pdf.pages]
+            # CORREÇÃO: Usa extração ordenada por coordenadas visuais
+            pages_text = [_extract_text_ordered_pdfplumber(page) for page in pdf.pages]
 
         if _pages_readable(pages_text):
             _dump_debug_text(source_name, pages_text, "pdfplumber")

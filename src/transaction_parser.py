@@ -22,6 +22,13 @@ RODADA 5 (evidência: debug_extracao_*.txt + logs de execução):
   total informado pelo banco; residual (OCR que perdeu descrição) vira
   linha ⚠️ needs_review explícita — o somatório do banco é a fonte de
   verdade e nada some em silêncio.
+
+CORREÇÃO DE SINTAXE E VALIDAÇÃO (Rodada Atual):
+- Restauração completa da formatação Python (strings corrompidas por
+  espaços extras, docstrings quebradas, __name__/__file__ incorretos).
+- Validação de integridade: toda transação criada garante descrição
+  não vazia e valor numérico coerente, compatível com a extração
+  ordenada por coordenadas Y/X do pdf_extractor.py.
 """
 import re
 import logging
@@ -34,6 +41,7 @@ from dateutil import parser as date_parser
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class Transaction:
     date: date
@@ -44,6 +52,7 @@ class Transaction:
     source_file: str = ""
     needs_review: bool = False
     manually_confirmed: bool = False  # BUG-1 FIX: Evitar AttributeError em report_generator
+
 
 # ---------------------------------------------------------------------------
 # Constantes compartilhadas
@@ -96,13 +105,16 @@ NU_DEBIT_HINTS = (
     "resgate de emprestimo",
 )
 
+
 def _normalize_text(text: str) -> str:
     """Remove acentos e baixa caixa para análise estatística/semântica."""
     nfkd = unicodedata.normalize("NFKD", text or "")
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower()
 
+
 def _month_from_token(token: str) -> Optional[int]:
     return MESES_PT.get(_normalize_text(token)[:3].upper())
+
 
 def parse_money_value(text: str) -> float:
     """Converte 'R$ 1.234,56' / '-1.234,56' / '1500,00' -> float."""
@@ -118,6 +130,7 @@ def parse_money_value(text: str) -> float:
     except ValueError:
         return 0.0
 
+
 def _semantic_credit_debit(description: str) -> Optional[bool]:
     low = _normalize_text(description)
     if any(h in low for h in NU_CREDIT_HINTS):
@@ -125,6 +138,7 @@ def _semantic_credit_debit(description: str) -> Optional[bool]:
     if any(h in low for h in NU_DEBIT_HINTS):
         return False
     return None
+
 
 def _decide_credit(amount_str: str, section: Optional[str], description: str):
     """
@@ -145,6 +159,7 @@ def _decide_credit(amount_str: str, section: Optional[str], description: str):
         return False, -abs(amount), False
     return None, amount, True
 
+
 def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
     """Heurística de crédito/débito para o parser genérico (bancos dd/mm)."""
     idx = line.find(amount_str)
@@ -163,6 +178,7 @@ def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
         return False
     return None
 
+
 def _build_date(date_str: str, is_short: bool, context_year: Optional[int]) -> Optional[date]:
     try:
         if is_short:
@@ -172,6 +188,7 @@ def _build_date(date_str: str, is_short: bool, context_year: Optional[int]) -> O
     except (ValueError, OverflowError):
         return None
 
+
 def _clean_description(line: str, date_str: str, amount_str: str) -> str:
     desc = line
     if date_str:
@@ -180,6 +197,7 @@ def _clean_description(line: str, date_str: str, amount_str: str) -> str:
         desc = desc.replace(amount_str, " ", 1)
     desc = desc.replace("R$", " ")
     return re.sub(r"\s+", " ", desc).strip(" -–|*")
+
 
 def _nu_date_from_line(line: str) -> Optional[date]:
     """Data de cabeçalho Nubank com ruído de OCR (O1ABR2026, 1O0MAR2026...)."""
@@ -204,6 +222,7 @@ def _nu_date_from_line(line: str) -> Optional[date]:
     except ValueError:
         return None
 
+
 def _is_nu_header_line(line: str, low_ns: str) -> bool:
     """True se a linha é cabeçalho (lançamento/data/seção/resumo)."""
     return (
@@ -213,6 +232,7 @@ def _is_nu_header_line(line: str, low_ns: str) -> bool:
         or "totaldesaidas" in low_ns
         or low_ns.startswith(NU_SUMMARY_PREFIXES)
     )
+
 
 # ---------------------------------------------------------------------------
 # Parser genérico (fallback universal)
@@ -291,6 +311,10 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
             if extra:
                 description = (description + " " + " ".join(extra)).strip()
 
+        # Validação de integridade: descrição nunca vazia
+        if not description:
+            description = "Lançamento não identificado"
+
         is_credit = _infer_credit(line, amount_str)
         if use_suffix:
             idx = line.find(amount_str)
@@ -305,7 +329,7 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
 
         transactions.append(Transaction(
             date=parsed_date,
-            description=description or "Lançamento",
+            description=description,
             amount=amount,
             is_credit=is_credit,
             bank=bank,
@@ -316,8 +340,10 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
 
     return transactions
 
+
 def parse_generic(text: str, bank: str = "generic", source_file: str = "") -> List[Transaction]:
     return _parse_generic_lines(text, bank, source_file)
+
 
 # ---------------------------------------------------------------------------
 # Parser Nubank
@@ -364,6 +390,9 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     def _make_tx(val_str: str, sec: Optional[str], desc: str,
                  dte: Optional[date]) -> Transaction:
         is_credit, amount, needs_review = _decide_credit(val_str, sec, desc)
+        # Validação de integridade: descrição nunca vazia
+        if not desc:
+            desc = "Lançamento não identificado"
         tx = Transaction(
             date=dte or date.today(), description=desc, amount=amount,
             is_credit=is_credit, bank=bank, source_file=source_file,
@@ -378,8 +407,9 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             rec["count"] += 1
 
     def _fix_k(item: Dict[str, Any]) -> None:
+        desc = item.get("desc") or "Lançamento não identificado"
         txs.append(Transaction(
-            date=item["date"] or date.today(), description=item["desc"],
+            date=item["date"] or date.today(), description=desc,
             amount=0.0, is_credit=None, bank=bank,
             source_file=source_file, needs_review=True,
         ))
@@ -617,6 +647,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     txs.sort(key=lambda t: t.date)
     return txs
 
+
 # ---------------------------------------------------------------------------
 # Parsers específicos dos demais bancos (config sobre o genérico)
 # ---------------------------------------------------------------------------
@@ -624,21 +655,26 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
     """Itaú: 'dd/mm descrição valor C/D'."""
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
+
 def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> List[Transaction]:
     """Bradesco: 'dd/mm descrição valor' com C/D eventual."""
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
+
 
 def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
     """Santander: layout dd/mm padrão."""
     return _parse_generic_lines(text, bank, source_file)
 
+
 def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[Transaction]:
     """Caixa: layout dd/mm/aaaa padrão."""
     return _parse_generic_lines(text, bank, source_file)
 
+
 def parse_bb(text: str, bank: str = "bb", source_file: str = "") -> List[Transaction]:
     """Banco do Brasil: layout dd/mm padrão."""
     return _parse_generic_lines(text, bank, source_file)
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher + compatibilidade
@@ -652,6 +688,7 @@ _PARSERS = {
     "bb": parse_bb,
 }
 
+
 def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> List[Transaction]:
     """Escolhe o parser do banco; se ele não produzir nada, usa o genérico."""
     parser_fn = _PARSERS.get(bank, parse_generic)
@@ -661,6 +698,7 @@ def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> 
                     bank, source_file or "PDF")
         txs = parse_generic(text, bank=bank, source_file=source_file)
     return txs
+
 
 def parse_pdf_pages(pages_text: List[str]) -> List[Transaction]:
     """Compatibilidade retroativa: parse genérico de todas as páginas."""

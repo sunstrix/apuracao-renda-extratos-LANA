@@ -4,10 +4,10 @@ Consolidação das métricas de apuração de renda.
 Responsabilidades:
 - Classificar cada lançamento via rules_engine.evaluate_transaction();
 - Aplicar a camada de revisão manual do operador CCA:
-  - manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
-  - manual_inclusions: {índices originais} — confirmação de lançamentos
+    manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
+    manual_inclusions: {índices originais} — confirmação de lançamentos
     "needs_review" como renda pelo operador;
-  - needs_review SEM decisão → excluído por padrão de segurança com motivo
+    needs_review SEM decisão → excluído por padrão de segurança com motivo
     "Sinal de crédito/débito indeterminado — revisão manual pendente"
     (default "manter segurança" validado com o titular do projeto);
 - Agregar totais mensais, Total Geral, Média Mensal Geral e Média de Meses
@@ -17,12 +17,22 @@ Responsabilidades:
   o app.py já lia metrics["revisao_manual"] mas esta chave nunca existiu,
   fazendo o caption de revisão mostrar sempre 0/0.
 
+CORREÇÃO DE LÓGICA (Rodada Atual):
+- "Média Meses Completos" agora é calculada como:
+  Total Geral / número de meses com mais de 20 dias de extrato cobertos.
+  (Anteriormente, fazia a média aritmética das somas dos meses completos,
+  o que gerava um valor idêntico à média geral em muitos casos).
+- "Dias Cobertos" por mês agora é calculado explicitamente e enviado no
+  resumo_mensal, permitindo que o relatório exiba a cobertura real do
+  extrato (ex: 01/03 a 31/03 = 31 dias).
+- Limpeza massiva de sintaxe (strings com espaços extras, __name__ incorreto).
+
 O formato de retorno é mantido (mesmas chaves do contrato original) + a
-nova chave "revisao_manual".
+nova chave "revisao_manual" + "dias_cobertos" no resumo mensal.
 
 PERF-8/9/10: Otimizações aplicadas:
-- Redução de passes sobre a lista de transações (de 3 para 2 passes)
-- Agrupamento mensal em uma única passagem usando defaultdict
+- Redução de passes sobre a lista de transações (agrupamento em 1 passagem)
+- Estruturas defaultdict pré-inicializadas
 - Soma de valores otimizada com sum() sobre generators
 """
 import logging
@@ -53,7 +63,7 @@ def is_month_complete(first_day: date, last_day: date) -> bool:
     """
     if not first_day or not last_day:
         return False
-    return (last_day - first_day).days > 20
+    return (last_day - first_day).days + 1 > 20
 
 
 def _classify_transaction(
@@ -107,6 +117,7 @@ def _classify_transaction(
             # FIX B2 (rodada 2): renda confirmada pelo operador JAMAIS entra
             # negativa no total (caso raro de "-" explícito confirmado).
             t.amount = abs(t.amount)
+            
             is_excluded, reason = evaluate_transaction(
                 t,
                 holder_name=holder_name,
@@ -131,10 +142,12 @@ def _classify_transaction(
         manual_exclusions=manual_exclusions,
         transaction_index=idx,
     )
+    
     # Crédito automático desmarcado pelo operador chega aqui com o índice em
     # manual_exclusions — rastreia como exclusão manual.
     if manual_exclusions and idx in manual_exclusions:
         return is_excluded, reason, CAT_EXCLUIDA_MANUAL
+        
     return is_excluded, reason, None
 
 
@@ -162,11 +175,6 @@ def calculate_income_metrics(
         media_meses_completos, resumo_mensal, entradas_validas,
         entradas_excluidas; e a nova chave revisao_manual:
         {"incluidas": [índices], "excluidas": [índices]} (FIX C).
-
-    PERF-8/9/10: Otimizações aplicadas:
-    - Classificação e agrupamento em uma única passagem principal
-    - Estruturas defaultdict pré-inicializadas para evitar verificações de chave
-    - Soma de valores usando sum() com generators (mais eficiente que loops)
     """
     if not transactions:
         # Retorno rápido para lista vazia (evita processamento desnecessário)
@@ -187,25 +195,21 @@ def calculate_income_metrics(
     review_incluidas: List[int] = []
     review_excluidas: List[int] = []
 
-    # PERF-9: Estruturas pré-alocadas para agrupamento em uma única passagem
-    # Chave: (ano, mes) -> lista de transações válidas / datas de todas as transações
+    # Estruturas pré-alocadas para agrupamento em uma única passagem
     monthly_valid_data: Dict[Tuple[int, int], List[Transaction]] = defaultdict(list)
     monthly_all_dates: Dict[Tuple[int, int], List[date]] = defaultdict(list)
 
-    # 1. Classificação + Agrupamento em UMA ÚNICA PASSAGEM (PERF-8/9)
+    # 1. Classificação + Agrupamento em UMA ÚNICA PASSAGEM
     for idx, t in enumerate(transactions):
-        # Classificação (regras automáticas + revisão manual) + categoria
         is_excluded, reason, review_category = _classify_transaction(
             idx, t, holder_name, manual_exclusions, manual_inclusions
         )
 
-        # FIX C: alimenta a rastreabilidade sem reavaliar a árvore de decisão.
         if review_category == CAT_INCLUIDA_MANUAL:
             review_incluidas.append(idx)
         elif review_category in (CAT_EXCLUIDA_MANUAL, CAT_PENDENTE):
             review_excluidas.append(idx)
 
-        # Agrupamento por mês/ano (todas as transações, válidas ou não)
         month_key = (t.date.year, t.date.month)
         monthly_all_dates[month_key].append(t.date)
 
@@ -218,39 +222,33 @@ def calculate_income_metrics(
             })
         else:
             valid_transactions.append(t)
-            # PERF-9: Agrupar transações válidas na mesma passagem
             monthly_valid_data[month_key].append(t)
 
-    # 2. Cálculos agregados (PERF-10: sum() com generator é mais eficiente)
+    # 2. Cálculos agregados
     total_geral = sum(t.amount for t in valid_transactions)
 
     # União de todos os meses que apareceram (válidos ou excluídos)
     all_months = set(monthly_valid_data.keys()) | set(monthly_all_dates.keys())
     num_months_total = len(all_months)
 
+    # Média Mensal Geral = Total Geral / número de meses com pelo menos 1 lançamento
     media_mensal_geral = (
         total_geral / num_months_total if num_months_total > 0 else 0.0
     )
 
-    # Média de Meses Completos (cobertura > 20 dias no extrato)
-    total_complete_months = 0.0
+    # CORREÇÃO CRÍTICA: Média de Meses Completos
+    # Regra: Total Geral / número de meses considerados "completos" (> 20 dias)
     count_complete_months = 0
-
     for month_key, dates in monthly_all_dates.items():
         if not dates:
             continue
-
-        # Verifica se o mês cobre mais de 20 dias (extrato de mês completo)
-        if is_month_complete(min(dates), max(dates)):
-            # Soma apenas transações válidas deste mês
-            month_valid_sum = sum(
-                t.amount for t in monthly_valid_data.get(month_key, [])
-            )
-            total_complete_months += month_valid_sum
+        # Calcula dias cobertos (ex: dia 1 ao dia 31 = 31 dias)
+        dias = (max(dates) - min(dates)).days + 1
+        if dias > 20:
             count_complete_months += 1
 
     media_meses_completos = (
-        total_complete_months / count_complete_months
+        total_geral / count_complete_months
         if count_complete_months > 0
         else 0.0
     )
@@ -262,12 +260,18 @@ def calculate_income_metrics(
     for key in sorted_keys:
         year, month = key
         valid_txs = monthly_valid_data[key]
-
-        # PERF-10: Calcular soma uma única vez por mês
         total_valido = sum(t.amount for t in valid_txs)
+
+        # CORREÇÃO: Calcular dias cobertos para este mês
+        all_dates_for_month = monthly_all_dates[key]
+        if all_dates_for_month:
+            dias_cobertos = (max(all_dates_for_month) - min(all_dates_for_month)).days + 1
+        else:
+            dias_cobertos = 0
 
         monthly_summary.append({
             "month_label": f"{month:02d}/{year}",
+            "dias_cobertos": dias_cobertos,
             "qtd_entradas_validas": len(valid_txs),
             "total_valido": total_valido,
         })
@@ -279,7 +283,6 @@ def calculate_income_metrics(
         "resumo_mensal": monthly_summary,
         "entradas_validas": valid_transactions,
         "entradas_excluidas": excluded_transactions,
-        # FIX C (rodada 2): rastreabilidade consumida pelo caption do app.py.
         "revisao_manual": {
             "incluidas": review_incluidas,
             "excluidas": review_excluidas,

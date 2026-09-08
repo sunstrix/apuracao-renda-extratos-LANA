@@ -389,7 +389,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     def _close_section_residual(rec: Optional[Dict[str, Any]],
                                 sec_label: Optional[str],
                                 sec_date: Optional[date]) -> None:
-        """FIX O: confere a seção contra o total do banco; residual vira ⚠️."""
+        """FIX O: confere a seção contra o total do banco; residual vira ️."""
         if rec is None or rec.get("expected") is None:
             return
         resid = rec["expected"] - rec["sum"]
@@ -693,6 +693,8 @@ def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transac
         # Validação: descrição não vazia
         if not description:
             description = "Lançamento não identificado"
+        # CORREÇÃO 4c: needs_review=True quando is_credit é None
+        needs_review = is_credit is None
         transactions.append(Transaction(
             date=parsed_date,
             description=description,
@@ -700,7 +702,7 @@ def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transac
             is_credit=is_credit,
             bank=bank,
             source_file=source_file,
-            needs_review=False,
+            needs_review=needs_review,
         ))
     return transactions
 
@@ -918,7 +920,7 @@ def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> 
 
 
 # ---------------------------------------------------------------------------
-# Parser Santander (específico)
+# Parser Santander (específico) - 4b
 # ---------------------------------------------------------------------------
 def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
     """
@@ -1026,7 +1028,7 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
 
 
 # ---------------------------------------------------------------------------
-# Parser Caixa Econômica Federal (específico)
+# Parser Caixa Econômica Federal (específico) - 4b
 # ---------------------------------------------------------------------------
 def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[Transaction]:
     """
@@ -1134,18 +1136,19 @@ def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[T
 
 
 # ---------------------------------------------------------------------------
-# Parser PicPay (específico)
+# Parser PicPay (específico) - 4a
 # ---------------------------------------------------------------------------
 def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List[Transaction]:
     """
     Parser do extrato PicPay.
-    Layout característico:
+    Layout assumido (a confirmar com extrato real):
      - Cabeçalho: "PicPay" + "PicPay Serviços S.A."
      - Formato: dd/mm/aaaa | Descrição | Valor
+     - Colunas: "Entrada" e "Saída" (ou valores com sinal + ou -)
      - Tipos: "Pix enviado", "Pix recebido", "Compra", "Recarga"
-     - Valores com sinal + (recebido) ou - (enviado)
+    TODO: Confirmar layout exato com extrato real do PicPay.
     Estratégia:
-     1. Detectar tipo de transação pela descrição
+     1. Detectar tipo de transação pela descrição ou coluna
      2. Extrair data, descrição e valor
      3. Crédito/débito baseado no tipo ou sinal
     """

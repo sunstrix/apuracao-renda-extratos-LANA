@@ -649,6 +649,258 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
 
 
 # ---------------------------------------------------------------------------
+# Parser C6 Bank
+# ---------------------------------------------------------------------------
+def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transaction]:
+    """
+    Parser do extrato C6 Bank.
+    
+    Layout característico:
+    - Cabeçalho: "C6 BANK" + "Agência: X • Conta: XXXXXXXX"
+    - Colunas: Data lançamento | Data contábil | Tipo | Descrição | Valor
+    - Formato: dd/mm | dd/mm | "Entrada/Saida PIX" | Descrição | R$ X.XXX,XX
+    - Agrupamento: "Junho 2026 (01/06/2026 - 30/06/2026)"
+    - Saldo: "Saldo do dia 09/06/26 → R$ 0,00"
+    
+    Estratégia:
+    1. Ignorar linhas de cabeçalho de mês e saldo
+    2. Extrair data da primeira coluna (dd/mm)
+    3. Identificar tipo (Entrada/Saida)
+    4. Extrair valor (com ou sem sinal -)
+    5. Crédito/débito baseado em "Entrada" vs "Saida"
+    """
+    transactions: List[Transaction] = []
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    
+    context_year: Optional[int] = None
+    i, n = 0, len(lines)
+    
+    # Regex para detectar cabeçalho de mês: "Junho 2026 (01/06/2026 - 30/06/2026)"
+    month_header_re = re.compile(r'([A-Za-zçãáéíóú]+)\s+(\d{4})')
+    # Regex para saldo do dia: "Saldo do dia 09/06/26"
+    balance_line_re = re.compile(r'Saldo do dia\s+\d{1,2}/\d{1,2}/\d{2,4}')
+    # Regex para data dd/mm
+    date_re = re.compile(r'^(\d{1,2}/\d{1,2})')
+    # Regex para valor monetário
+    money_re = re.compile(r'(-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})')
+    
+    while i < n:
+        line = lines[i]
+        i += 1
+        
+        if not line:
+            continue
+        
+        # Verificar cabeçalho de mês para capturar ano
+        month_match = month_header_re.search(line)
+        if month_match and '(' in line and ')' in line:
+            # É um cabeçalho como "Junho 2026 (01/06/2026 - 30/06/2026)"
+            year_str = month_match.group(2)
+            context_year = int(year_str)
+            continue
+        
+        # Ignorar linhas de saldo
+        if balance_line_re.search(line):
+            continue
+        
+        # Ignorar cabeçalhos de coluna
+        if line.upper().startswith(('DATA', 'TIPO', 'DESCRIÇÃO', 'VALOR')):
+            continue
+        
+        # Tentar extrair data da primeira coluna
+        date_match = date_re.match(line)
+        if not date_match:
+            continue
+        
+        date_str = date_match.group(1)
+        
+        # Extrair valor (última coluna)
+        money_matches = money_re.findall(line)
+        if not money_matches:
+            continue
+        
+        # Pegar o último valor encontrado (coluna Valor)
+        amount_str = money_matches[-1]
+        
+        # Extrair tipo (Entrada/Saida)
+        is_credit = None
+        if 'Entrada' in line:
+            is_credit = True
+        elif 'Saida' in line or 'Saída' in line:
+            is_credit = False
+        
+        # Extrair descrição (entre o tipo e o valor)
+        # Remover data, tipo e valor da linha para obter a descrição
+        description = line
+        description = re.sub(date_re, '', description)
+        description = re.sub(r'\d{1,2}/\d{1,2}', '', description, count=1)  # Segunda data (contábil)
+        description = re.sub(r'(Entrada|Saida|Saída)\s*\w*', '', description)
+        description = re.sub(money_re, '', description)
+        description = description.strip(' -|•')
+        
+        # Se ano não foi capturado do cabeçalho, tentar inferir
+        if context_year is None:
+            # Procurar ano em linhas anteriores ou usar ano atual
+            context_year = date.today().year
+        
+        # Construir data completa
+        try:
+            day, month = map(int, date_str.split('/'))
+            parsed_date = date(context_year, month, day)
+        except (ValueError, IndexError):
+            continue
+        
+        # Converter valor
+        amount = parse_money_value(amount_str)
+        
+        # Validação: descrição não vazia
+        if not description:
+            description = "Lançamento não identificado"
+        
+        transactions.append(Transaction(
+            date=parsed_date,
+            description=description,
+            amount=amount,
+            is_credit=is_credit,
+            bank=bank,
+            source_file=source_file,
+            needs_review=False,
+        ))
+    
+    return transactions
+
+
+# ---------------------------------------------------------------------------
+# Parser Banco Inter
+# ---------------------------------------------------------------------------
+def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[Transaction]:
+    """
+    Parser do extrato Banco Inter.
+    
+    Layout característico:
+    - Cabeçalho: "Inter" + "Banco Inter"
+    - Data por extenso: "5 de Março de 2026"
+    - Formato: Descrição | Valor | Saldo por transação
+    - Tipos: "Pix enviado: ...", "Transferencia recebida: ..."
+    - Saldo: "Saldo do dia: R$ 2.352,11"
+    
+    Estratégia:
+    1. Detectar data por extenso no início da linha
+    2. Ignorar linhas de saldo
+    3. Extrair descrição completa
+    4. Extrair valor (primeiro valor após descrição)
+    5. Crédito/débito baseado no sinal (- ou positivo)
+    """
+    transactions: List[Transaction] = []
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    
+    context_year: Optional[int] = None
+    i, n = 0, len(lines)
+    
+    # Regex para data por extenso: "5 de Março de 2026"
+    date_extenso_re = re.compile(r'(\d{1,2})\s+de\s+([A-Za-zçãáéíóú]+)\s+de\s+(\d{4})')
+    # Regex para saldo do dia
+    balance_line_re = re.compile(r'Saldo do dia:\s*R\$')
+    # Regex para valor monetário
+    money_re = re.compile(r'(-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})')
+    # Meses em português
+    meses_pt = {
+        'janeiro': 1, 'fevereiro': 2, 'março': 3, 'marco': 3,
+        'abril': 4, 'maio': 5, 'junho': 6, 'julho': 7,
+        'agosto': 8, 'setembro': 9, 'outubro': 10,
+        'novembro': 11, 'dezembro': 12
+    }
+    
+    # Variável para rastrear a última data encontrada
+    last_date: Optional[date] = None
+    
+    while i < n:
+        line = lines[i]
+        i += 1
+        
+        if not line:
+            continue
+        
+        # Verificar se é linha de data por extenso
+        date_match = date_extenso_re.search(line)
+        if date_match:
+            day = int(date_match.group(1))
+            month_name = date_match.group(2).lower()
+            year = int(date_match.group(3))
+            
+            month = meses_pt.get(month_name)
+            if month is None:
+                continue
+            
+            context_year = year
+            
+            # Tentar criar a data
+            try:
+                last_date = date(year, month, day)
+            except ValueError:
+                pass
+            
+            # Esta linha também tem "Saldo do dia: R$ X.XXX,XX"
+            # Ignorar e continuar para próxima linha
+            continue
+        
+        # Ignorar linhas de saldo
+        if balance_line_re.search(line):
+            continue
+        
+        # Ignorar cabeçalhos
+        if line.upper().startswith(('VALOR', 'SALDO POR TRANSAÇÃO', 'CPF/CNPJ', 'PERÍODO')):
+            continue
+        
+        # Tentar extrair valor
+        money_matches = money_re.findall(line)
+        if not money_matches:
+            continue
+        
+        # O primeiro valor é o da transação (antes do saldo)
+        amount_str = money_matches[0]
+        
+        # Extrair descrição (tudo antes do primeiro valor)
+        description = line.split(amount_str)[0].strip()
+        
+        # Limpar descrição
+        description = description.strip(' -|•')
+        
+        # Determinar se é crédito ou débito
+        is_credit = None
+        if amount_str.startswith('-'):
+            is_credit = False
+            amount = -parse_money_value(amount_str)
+        else:
+            is_credit = True
+            amount = parse_money_value(amount_str)
+        
+        # Validação: descrição não vazia
+        if not description:
+            description = "Lançamento não identificado"
+        
+        # Usar a última data encontrada
+        parsed_date = last_date
+        if parsed_date is None:
+            # Fallback: usar data genérica
+            if context_year is None:
+                context_year = date.today().year
+            parsed_date = date(context_year, 1, 1)
+        
+        transactions.append(Transaction(
+            date=parsed_date,
+            description=description,
+            amount=amount,
+            is_credit=is_credit,
+            bank=bank,
+            source_file=source_file,
+            needs_review=False,
+        ))
+    
+    return transactions
+
+
+# ---------------------------------------------------------------------------
 # Parsers específicos dos demais bancos (config sobre o genérico)
 # ---------------------------------------------------------------------------
 def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Transaction]:
@@ -676,16 +928,27 @@ def parse_bb(text: str, bank: str = "bb", source_file: str = "") -> List[Transac
     return _parse_generic_lines(text, bank, source_file)
 
 
+def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List[Transaction]:
+    """
+    Parser do extrato PicPay (a ser implementado quando receber o extrato).
+    Por enquanto, usa o parser genérico.
+    """
+    return _parse_generic_lines(text, bank, source_file)
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher + compatibilidade
 # ---------------------------------------------------------------------------
 _PARSERS = {
     "nubank": parse_nubank,
+    "c6": parse_c6,
+    "inter": parse_inter,
     "itau": parse_itau,
     "bradesco": parse_bradesco,
     "santander": parse_santander,
     "caixa": parse_caixa,
     "bb": parse_bb,
+    "picpay": parse_picpay,
 }
 
 

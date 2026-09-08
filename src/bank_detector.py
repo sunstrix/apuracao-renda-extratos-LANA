@@ -1,6 +1,5 @@
 """
 Detector automático de instituição financeira a partir do texto extraído do PDF.
-
 A ordem de verificação importa: extratos do Nubank citam Itaú/Santander/Bradesco
 como contrapartes de Pix, então os marcadores do Nubank (header/rodapé próprios)
 devem ser verificados primeiro.
@@ -14,20 +13,32 @@ _BANK_MARKERS: List[Tuple[str, Tuple[str, ...]]] = [
         "nu pagamentos s.a.", "nu financeira s.a.", "nubank.com.br",
         "nu pagamentos - ip", "nu pagamentos - |p", "agência 0001 conta",
     )),
+    ("c6", (
+        "c6 bank", "c6bank",
+    )),
+    ("inter", (
+        "banco inter", "inter cn",
+    )),
     ("caixa", ("caixa economica federal",)),
     ("bb", ("banco do brasil",)),
     ("bradesco", ("bradesco",)),
     ("santander", ("santander",)),
     ("itau", ("itau unibanco", "itau",)),
+    ("picpay", (
+        "picpay", "pic pay",
+    )),
 ]
 
 _DISPLAY_NAMES = {
     "nubank": "Nubank (Nu Pagamentos S.A.)",
+    "c6": "C6 Bank",
+    "inter": "Banco Inter",
     "itau": "Itaú Unibanco",
     "bradesco": "Bradesco",
     "santander": "Santander",
     "caixa": "Caixa Econômica Federal",
     "bb": "Banco do Brasil",
+    "picpay": "PicPay",
     "generic": "Instituição não identificada",
 }
 

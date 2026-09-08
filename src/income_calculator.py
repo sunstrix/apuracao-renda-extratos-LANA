@@ -1,13 +1,12 @@
 """
 Consolidação das métricas de apuração de renda.
-
 Responsabilidades:
 - Classificar cada lançamento via rules_engine.evaluate_transaction();
 - Aplicar a camada de revisão manual do operador CCA:
-    manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
-    manual_inclusions: {índices originais} — confirmação de lançamentos
+  * manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
+  * manual_inclusions: {índices originais} — confirmação de lançamentos
     "needs_review" como renda pelo operador;
-    needs_review SEM decisão → excluído por padrão de segurança com motivo
+  * needs_review SEM decisão → excluído por padrão de segurança com motivo
     "Sinal de crédito/débito indeterminado — revisão manual pendente"
     (default "manter segurança" validado com o titular do projeto);
 - Agregar totais mensais, Total Geral, Média Mensal Geral e Média de Meses
@@ -39,7 +38,6 @@ import logging
 from collections import defaultdict
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
-
 from src.transaction_parser import Transaction
 from src.rules_engine import evaluate_transaction
 
@@ -78,11 +76,11 @@ def _classify_transaction(
     respeitando a revisão manual do operador.
 
     Prioridade:
-    1. Exclusão manual explícita (motivo propagado pelo rules_engine);
-    2. Inclusão manual explícita (força crédito; regras automáticas de
-       compliance — mesma titularidade/apostas — continuam ativas);
-    3. Padrão de segurança para needs_review sem decisão ("manter segurança":
-       exclui e audita — nunca incluir renda por presunção em laudo).
+      1. Exclusão manual explícita (motivo propagado pelo rules_engine);
+      2. Inclusão manual explícita (força crédito; regras automáticas de
+         compliance — mesma titularidade/apostas — continuam ativas);
+      3. Padrão de segurança para needs_review sem decisão ("manter segurança":
+         exclui e audita — nunca incluir renda por presunção em laudo).
 
     FIX C (rodada 2): retorna também review_category para o cálculo da chave
     "revisao_manual" sem duplicar a árvore de decisão no loop principal:
@@ -117,7 +115,6 @@ def _classify_transaction(
             # FIX B2 (rodada 2): renda confirmada pelo operador JAMAIS entra
             # negativa no total (caso raro de "-" explícito confirmado).
             t.amount = abs(t.amount)
-            
             is_excluded, reason = evaluate_transaction(
                 t,
                 holder_name=holder_name,
@@ -142,12 +139,10 @@ def _classify_transaction(
         manual_exclusions=manual_exclusions,
         transaction_index=idx,
     )
-    
     # Crédito automático desmarcado pelo operador chega aqui com o índice em
     # manual_exclusions — rastreia como exclusão manual.
     if manual_exclusions and idx in manual_exclusions:
         return is_excluded, reason, CAT_EXCLUIDA_MANUAL
-        
     return is_excluded, reason, None
 
 
@@ -190,7 +185,6 @@ def calculate_income_metrics(
 
     valid_transactions: List[Transaction] = []
     excluded_transactions: List[Dict[str, Any]] = []
-
     # FIX C (rodada 2): rastreabilidade da revisão manual.
     review_incluidas: List[int] = []
     review_excluidas: List[int] = []
@@ -204,7 +198,6 @@ def calculate_income_metrics(
         is_excluded, reason, review_category = _classify_transaction(
             idx, t, holder_name, manual_exclusions, manual_inclusions
         )
-
         if review_category == CAT_INCLUIDA_MANUAL:
             review_incluidas.append(idx)
         elif review_category in (CAT_EXCLUIDA_MANUAL, CAT_PENDENTE):
@@ -256,19 +249,16 @@ def calculate_income_metrics(
     # 3. Resumo mensal ordenado para interface/relatório
     monthly_summary: List[Dict[str, Any]] = []
     sorted_keys = sorted(monthly_valid_data.keys(), key=lambda x: (x[0], x[1]))
-
     for key in sorted_keys:
         year, month = key
         valid_txs = monthly_valid_data[key]
         total_valido = sum(t.amount for t in valid_txs)
-
         # CORREÇÃO: Calcular dias cobertos para este mês
         all_dates_for_month = monthly_all_dates[key]
         if all_dates_for_month:
             dias_cobertos = (max(all_dates_for_month) - min(all_dates_for_month)).days + 1
         else:
             dias_cobertos = 0
-
         monthly_summary.append({
             "month_label": f"{month:02d}/{year}",
             "dias_cobertos": dias_cobertos,

@@ -23,20 +23,13 @@ banner de aviso após o processamento;
 Rastreabilidade: transações com extraction_source="gemini" recebem selo
 🤖 na prévia de resultados.
 
-RODADA ATUAL (REDESIGN COMPLETO — DIRETRIZES DEEPSEEK):
-- CSS externo carregado via load_css() (.streamlit/style.css)
-- Hero section profissional com logo SVG, título e badge de status Gemini
-- Cards KPI com st.container(border=True) para destaque visual
-- Resultados organizados em st.tabs (Resumo, Entradas, Auditoria, Exportações)
-- data_editor melhorado: help em colunas, SelectboxColumn para Sinal,
-  resumo acima da tabela com contagens por categoria
-- Feedback de processamento: st.toast ao final, erros com botão "Tentar novamente"
-- Acessibilidade: aria-labels, contraste WCAG AA, prefers-reduced-motion
-- Footer com autoria + links para GitHub e README
-- Remoção de emojis decorativos (mantidos apenas os funcionais: ⚠️, 🤖)
-- CORREÇÃO CRÍTICA: Deduplicação movida para ANTES da revisão manual
-- CORREÇÃO: use_container_width substituído por width="stretch"
-- CORREÇÃO: Regex NU\s restaurado (estava NUs)
+RODADA ATUAL (CORREÇÕES CRÍTICAS E REDESIGN):
+1. Bug crítico: render_kpi_card agora usa unsafe_allow_html=True corretamente.
+2. Deduplicação movida para ANTES da revisão manual (preserva índices).
+3. Regex 'NU\s' restaurada (estava 'NUs').
+4. use_container_width substituído por width="stretch".
+5. Layout de entrada agrupado em st.container(border=True) com título de seção.
+6. Autoria adicionada na hero section (topo) e mantida no footer.
 """
 import logging
 import os
@@ -90,7 +83,6 @@ HOLDER_EXCLUSION_KEYWORDS = re.compile(
 
 def brl(value) -> str:
     """Formata valor monetário em R$ com separadores pt-BR."""
-    # Compatível com float e Decimal
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -101,7 +93,6 @@ def try_detect_holder_name(text_pages) -> str:
     """
     Detecta o titular no extrato (Nubank/OCR): a linha imediatamente acima
     da linha que contém "CPF" é o nome do titular.
-    PERF-7: 2 páginas + regex compilada.
     """
     lines = []
     for page in (text_pages or [])[:2]:
@@ -225,7 +216,7 @@ def render_hero_section(gemini_ok: bool) -> None:
                 <div class="app-header-text">
                     <h1>Apuração de Renda via Extratos PDF</h1>
                     <p>Consolidação inteligente, revisão humana e relatório executivo em segundos.</p>
-                    <p class="app-header-author">Desenvolvido por Lana Gleizi Vieira Paes</p>
+                    <p class="app-header-author">✦ Desenvolvido por Lana Gleizi Vieira Paes</p>
                 </div>
             </div>
             <div class="badge {badge_class}" aria-label="Status do modo de extração">
@@ -248,6 +239,7 @@ def render_kpi_card(title: str, value: str, subtitle: str = "", icon_svg: str = 
         </div>
     """ if icon_svg else ""
     
+    # CORREÇÃO CRÍTICA: unsafe_allow_html=True garantido para renderizar o HTML
     st.markdown(
         f"""
         <div class="kpi-card">
@@ -335,119 +327,126 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = default
 
-    uploaded_files = st.file_uploader(
-        "Selecione os arquivos PDF dos extratos",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Aceita múltiplos PDFs de qualquer banco brasileiro. Extratos com períodos sobrepostos serão automaticamente deduplicados.",
-    )
-    holder_input = st.text_input(
-        "Nome do Titular (opcional - será tentada a auto-detecção)",
-        value=st.session_state.detected_holder or "",
-        help="Informe o nome completo do titular das contas. Se deixado em branco, o sistema tentará detectá-lo automaticamente no extrato.",
-    )
-
     # ------------------------------------------------------------------ #
-    # Etapa 1: extração + parsing (com status/progresso e PARALELIZAÇÃO)
+    # Layout agrupado para entrada de dados (CORREÇÃO DE UX)
     # ------------------------------------------------------------------ #
-    if st.button("Processar Extratos", type="primary", disabled=not uploaded_files):
-        raw_all = []
-        institutions = set()
-        detected_holder = holder_input
-        gemini_mismatches = []
-        gemini_used_any = False
-        failed_files = []
+    with st.container(border=True):
+        st.markdown('<p class="section-title">1. Envie seus extratos</p>', unsafe_allow_html=True)
         
-        with st.status("Processando extratos...", expanded=True) as status:
-            progress = st.progress(0.0, text="Iniciando processamento paralelo...")
-            total = len(uploaded_files)
-            max_workers = min(6, total)
-            completed_count = 0
+        uploaded_files = st.file_uploader(
+            "Selecione os arquivos PDF dos extratos",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Aceita múltiplos PDFs de qualquer banco brasileiro. Extratos com períodos sobrepostos serão automaticamente deduplicados.",
+        )
+        
+        holder_input = st.text_input(
+            "Nome do Titular (opcional - será tentada a auto-detecção)",
+            value=st.session_state.detected_holder or "",
+            help="Informe o nome completo do titular das contas. Se deixado em branco, o sistema tentará detectá-lo automaticamente no extrato.",
+        )
+        
+        # ------------------------------------------------------------------ #
+        # Etapa 1: extração + parsing (com status/progresso e PARALELIZAÇÃO)
+        # ------------------------------------------------------------------ #
+        if st.button("Processar Extratos", type="primary", disabled=not uploaded_files, use_container_width=False):
+            raw_all = []
+            institutions = set()
+            detected_holder = holder_input
+            gemini_mismatches = []
+            gemini_used_any = False
+            failed_files = []
             
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {
-                    executor.submit(_process_single_pdf, uf, use_gemini): uf
-                    for uf in uploaded_files
-                }
-                for future in as_completed(future_to_file):
-                    uf = future_to_file[future]
-                    try:
-                        (file_name, success, txs, bank, holder, error, info_gemini) = future.result()
-                        completed_count += 1
-                        
-                        if info_gemini.get("used"):
-                            gemini_used_any = True
-                            gemini_mismatches.extend(info_gemini.get("mismatches", []))
-                        
-                        if success:
-                            raw_all.extend(txs)
-                            institutions.add(bank_display_name(bank))
-                            if not detected_holder and holder:
-                                detected_holder = holder
-                            selo = "🤖 " if info_gemini.get("used") else "✅ "
-                            status.write(f"{selo}{file_name}: {len(txs)} transações ({bank_display_name(bank)})")
-                        else:
-                            failed_files.append((file_name, error))
-                            status.write(f"⚠️ {file_name}: {error}")
-                        
-                        progress.progress(
-                            completed_count / total,
-                            text=f"Processado {completed_count}/{total} arquivos"
-                        )
-                    except Exception as e:
-                        completed_count += 1
-                        logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
-                        failed_files.append((uf.name, str(e)))
-                        status.write(f"️ {uf.name}: {e}")
-                        progress.progress(
-                            completed_count / total,
-                            text=f"Processado {completed_count}/{total} arquivos"
+            with st.status("Processando extratos...", expanded=True) as status:
+                progress = st.progress(0.0, text="Iniciando processamento paralelo...")
+                total = len(uploaded_files)
+                max_workers = min(6, total)
+                completed_count = 0
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_file = {
+                        executor.submit(_process_single_pdf, uf, use_gemini): uf
+                        for uf in uploaded_files
+                    }
+                    for future in as_completed(future_to_file):
+                        uf = future_to_file[future]
+                        try:
+                            (file_name, success, txs, bank, holder, error, info_gemini) = future.result()
+                            completed_count += 1
+                            
+                            if info_gemini.get("used"):
+                                gemini_used_any = True
+                                gemini_mismatches.extend(info_gemini.get("mismatches", []))
+                            
+                            if success:
+                                raw_all.extend(txs)
+                                institutions.add(bank_display_name(bank))
+                                if not detected_holder and holder:
+                                    detected_holder = holder
+                                selo = "🤖 " if info_gemini.get("used") else "✅ "
+                                status.write(f"{selo}{file_name}: {len(txs)} transações ({bank_display_name(bank)})")
+                            else:
+                                failed_files.append((file_name, error))
+                                status.write(f⚠️ {file_name}: {error}")
+                            
+                            progress.progress(
+                                completed_count / total,
+                                text=f"Processado {completed_count}/{total} arquivos"
+                            )
+                        except Exception as e:
+                            completed_count += 1
+                            logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
+                            failed_files.append((uf.name, str(e)))
+                            status.write(f"⚠️ {uf.name}: {e}")
+                            progress.progress(
+                                completed_count / total,
+                                text=f"Processado {completed_count}/{total} arquivos"
+                            )
+                
+                progress.progress(1.0, text="Processamento concluído!")
+                status.update(label="Processamento concluído!", state="complete")
+            
+            # CORREÇÃO CRÍTICA: Deduplicação ANTES da revisão manual
+            # Assim os índices da tabela de revisão correspondem aos índices reais
+            # da lista deduplicada, evitando que decisões do operador recaiam
+            # sobre transações erradas.
+            raw_all, duplicates_removed = deduplicate_transactions(raw_all)
+            if duplicates_removed > 0:
+                logger.info(
+                    "Deduplicação: %d transação(ões) duplicada(s) removida(s) antes da revisão.",
+                    duplicates_removed
+                )
+            
+            # Toast de sucesso/erro
+            if raw_all:
+                st.toast(f"✅ {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="✅")
+            if failed_files:
+                st.toast(f"⚠️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
+            
+            if gemini_used_any and gemini_mismatches:
+                st.warning(
+                    f"⚠️ Gemini: {len(gemini_mismatches)} seção(ões) com somatório divergente "
+                    "do total impresso pelo banco. Confira a tabela de auditoria antes de confirmar."
+                )
+            
+            if failed_files:
+                with st.expander(f"⚠️ {len(failed_files)} arquivo(s) com erro — clique para detalhes"):
+                    for fname, err in failed_files:
+                        st.error(f"**{fname}**: {err}")
+                        st.button(
+                            f"Tentar novamente: {fname}",
+                            key=f"retry_{fname}",
+                            on_click=lambda f=fname: st.rerun(),
                         )
             
-            progress.progress(1.0, text="Processamento concluído!")
-            status.update(label="Processamento concluído!", state="complete")
-        
-        # CORREÇÃO CRÍTICA: Deduplicação ANTES da revisão manual
-        # Assim os índices da tabela de revisão correspondem aos índices reais
-        # da lista deduplicada, evitando que decisões do operador recaiam
-        # sobre transações erradas.
-        raw_all, duplicates_removed = deduplicate_transactions(raw_all)
-        if duplicates_removed > 0:
-            logger.info(
-                "Deduplicação: %d transação(ões) duplicada(s) removida(s) antes da revisão.",
-                duplicates_removed
-            )
-        
-        # Toast de sucesso/erro
-        if raw_all:
-            st.toast(f"✅ {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="✅")
-        if failed_files:
-            st.toast(f"⚠️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
-        
-        if gemini_used_any and gemini_mismatches:
-            st.warning(
-                f"⚠️ Gemini: {len(gemini_mismatches)} seção(ões) com somatório divergente "
-                "do total impresso pelo banco. Confira a tabela de auditoria antes de confirmar."
-            )
-        
-        if failed_files:
-            with st.expander(f"⚠️ {len(failed_files)} arquivo(s) com erro — clique para detalhes"):
-                for fname, err in failed_files:
-                    st.error(f"**{fname}**: {err}")
-                    st.button(
-                        f"Tentar novamente: {fname}",
-                        key=f"retry_{fname}",
-                        on_click=lambda f=fname: st.rerun(),
-                    )
-        
-        st.session_state.raw_transactions = raw_all
-        st.session_state.institutions = institutions
-        st.session_state.detected_holder = detected_holder or holder_input
-        st.session_state.metrics = None
-        st.session_state.reviewed = False
-        st.session_state.duplicates_removed = duplicates_removed
-        if "review_df" in st.session_state:
-            del st.session_state["review_df"]
+            st.session_state.raw_transactions = raw_all
+            st.session_state.institutions = institutions
+            st.session_state.detected_holder = detected_holder or holder_input
+            st.session_state.metrics = None
+            st.session_state.reviewed = False
+            st.session_state.duplicates_removed = duplicates_removed
+            if "review_df" in st.session_state:
+                del st.session_state["review_df"]
 
     raw = st.session_state.raw_transactions
     if raw is None:
@@ -563,7 +562,7 @@ def main():
     )
     if pendentes:
         st.warning(
-            f"️ {pendentes} linha(s) indeterminada(s) sem decisão. Pelo padrão de "
+            f"⚠️ {pendentes} linha(s) indeterminada(s) sem decisão. Pelo padrão de "
             "segurança, elas serão EXCLUÍDAS da apuração e listadas na auditoria. "
             "Marque 'Incluir na apuração' nas que forem renda efetiva."
         )

@@ -23,17 +23,17 @@ banner de aviso após o processamento;
 Rastreabilidade: transações com extraction_source="gemini" recebem selo
 🤖 na prévia de resultados.
 
-RODADA ATUAL (REDESIGN COMPLETO — DIRETRIZES DEEPSEEK):
-- CSS externo carregado via load_css() (.streamlit/style.css)
-- Hero section profissional com logo SVG, título e badge de status Gemini
-- Cards KPI com st.container(border=True) para destaque visual
-- Resultados organizados em st.tabs (Resumo, Entradas, Auditoria, Exportações)
-- data_editor melhorado: help em colunas, SelectboxColumn para Sinal,
-  resumo acima da tabela com contagens por categoria
-- Feedback de processamento: st.toast ao final, erros com botão "Tentar novamente"
-- Acessibilidade: aria-labels, contraste WCAG AA, prefers-reduced-motion
-- Footer com autoria + links para GitHub e README
-- Remoção de emojis decorativos (mantidos apenas os funcionais: ⚠️, 🤖)
+RODADA ATUAL (CORREÇÕES CRÍTICAS):
+1. Bug crítico da deduplicação: movida de calculate_income_metrics() para
+   app.py, ANTES da revisão manual. Assim os índices da tabela de revisão
+   correspondem aos índices reais da lista deduplicada, evitando que
+   decisões do operador recaiam sobre transações erradas.
+2. Regressão regex: HOLDER_EXCLUSION_KEYWORDS revertido de 'NUs' para 'NU\s'
+   (espaço após NU), restaurando filtro correto contra "NU PAGAMENTOS S.A.".
+3. Warnings de depreciação: use_container_width substituído por width="stretch"
+   (compatível com Streamlit >= 1.62).
+4. Autoria: crédito "Desenvolvido por Lana Gleizi Vieira Paes" adicionado
+   na hero section (topo da página), mantido também no rodapé.
 """
 import logging
 import os
@@ -43,7 +43,7 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.pdf_extractor import extract_text_from_pdf
 from src.bank_detector import detect_bank, bank_display_name
-from src.transaction_parser import parse_statement
+from src.transaction_parser import parse_statement, deduplicate_transactions
 from src.income_calculator import calculate_income_metrics
 from src.report_generator import generate_report, generate_excel, generate_csv
 from src.gemini_extractor import (
@@ -78,9 +78,10 @@ load_css("style.css")
 
 # ---------------------------------------------------------------------------
 # PERF-7: Regex compiladas FORA da função para evitar recompilação a cada chamada
+# CORREÇÃO: 'NUs' revertido para 'NU\s' (espaço após NU)
 # ---------------------------------------------------------------------------
 HOLDER_EXCLUSION_KEYWORDS = re.compile(
-    r"(CPF|CNPJ|AGÊNCIA|AGENCIA|CONTA|BANCO|MOVIMENTA|SALDO|EXTRATO|NUs|VALORES)",
+    r"(CPF|CNPJ|AGÊNCIA|AGENCIA|CONTA|BANCO|MOVIMENTA|SALDO|EXTRATO|NU\s|VALORES)",
     re.IGNORECASE
 )
 
@@ -201,10 +202,10 @@ def build_review_dataframe(raw) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ---------------------------------------------------------------------------
-# HERO SECTION (Header profissional com logo, título e badge)
+# HERO SECTION (Header profissional com logo, título, autoria e badge)
 # ---------------------------------------------------------------------------
 def render_hero_section(gemini_ok: bool) -> None:
-    """Renderiza o cabeçalho hero com logo SVG, título e badge de status."""
+    """Renderiza o cabeçalho hero com logo SVG, título, autoria e badge de status."""
     badge_class = "badge-success" if gemini_ok else "badge-info"
     badge_text = "Gemini Ativo" if gemini_ok else "Modo Local"
     badge_dot = '<span class="badge-dot"></span>' if gemini_ok else ""
@@ -221,6 +222,7 @@ def render_hero_section(gemini_ok: bool) -> None:
                 <div class="app-header-text">
                     <h1>Apuração de Renda via Extratos PDF</h1>
                     <p>Consolidação inteligente, revisão humana e relatório executivo em segundos.</p>
+                    <p class="app-header-author">Desenvolvido por Lana Gleizi Vieira Paes</p>
                 </div>
             </div>
             <div class="badge {badge_class}" aria-label="Status do modo de extração">
@@ -294,7 +296,7 @@ def render_footer() -> None:
 def main():
     gemini_ok = gemini_available()
     
-    # Hero section
+    # Hero section (com autoria no topo)
     render_hero_section(gemini_ok)
     
     # ------------------------------------------------------------------ #
@@ -402,11 +404,22 @@ def main():
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
         
+        # CORREÇÃO CRÍTICA: Deduplicação ANTES da revisão manual
+        # Assim os índices da tabela de revisão correspondem aos índices reais
+        # da lista deduplicada, evitando que decisões do operador recaiam
+        # sobre transações erradas.
+        raw_all, duplicates_removed = deduplicate_transactions(raw_all)
+        if duplicates_removed > 0:
+            logger.info(
+                "Deduplicação: %d transação(ões) duplicada(s) removida(s) antes da revisão.",
+                duplicates_removed
+            )
+        
         # Toast de sucesso/erro
         if raw_all:
             st.toast(f"✅ {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="✅")
         if failed_files:
-            st.toast(f"⚠️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
+            st.toast(f"️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
         
         if gemini_used_any and gemini_mismatches:
             st.warning(
@@ -429,6 +442,7 @@ def main():
         st.session_state.detected_holder = detected_holder or holder_input
         st.session_state.metrics = None
         st.session_state.reviewed = False
+        st.session_state.duplicates_removed = duplicates_removed
         if "review_df" in st.session_state:
             del st.session_state["review_df"]
 
@@ -455,7 +469,7 @@ def main():
             "Banco": bank_display_name(t.bank) if t.bank else "-",
             "Arquivo": t.source_file or "-",
         } for t in raw])
-        st.dataframe(df_raw, use_container_width=True, height=320)
+        st.dataframe(df_raw, width="stretch", height=320)
 
     # ------------------------------------------------------------------ #
     # Etapa 3: revisão manual obrigatória (st.data_editor melhorado)
@@ -486,7 +500,7 @@ def main():
     edited = st.data_editor(
         st.session_state.review_df,
         num_rows="fixed",
-        use_container_width=True,
+        width="stretch",
         height=420,
         column_config={
             "ID": st.column_config.NumberColumn(
@@ -594,7 +608,7 @@ def main():
         if n_gemini or revisao:
             info_parts = []
             if n_gemini:
-                info_parts.append(f"🤖 {n_gemini} lançamento(s) via IA (Gemini)")
+                info_parts.append(f" {n_gemini} lançamento(s) via IA (Gemini)")
             if revisao:
                 info_parts.append(
                     f"Revisão: {len(revisao.get('incluidas', []))} confirmado(s) • "
@@ -638,7 +652,7 @@ def main():
             if metrics["resumo_mensal"]:
                 df_resumo = pd.DataFrame(metrics["resumo_mensal"])
                 df_resumo.columns = ["Mês/Ano", "Dias Cobertos", "Qtd Entradas Válidas", "Total Válido Mensal"]
-                st.dataframe(df_resumo, use_container_width=True)
+                st.dataframe(df_resumo, width="stretch")
             else:
                 st.info("Nenhum dado mensal consolidado disponível.")
         
@@ -649,7 +663,7 @@ def main():
                     "Descrição": t.description,
                     "Valor": t.amount,
                 } for t in metrics["entradas_validas"]])
-                st.dataframe(df_validas, use_container_width=True)
+                st.dataframe(df_validas, width="stretch")
             else:
                 st.info("Nenhuma entrada válida encontrada.")
         
@@ -658,7 +672,7 @@ def main():
                 df_exc = pd.DataFrame(metrics["entradas_excluidas"])
                 df_exc["date"] = pd.to_datetime(df_exc["date"]).dt.strftime("%d/%m/%Y")
                 df_exc.columns = ["Data", "Descrição Original", "Regra de Exclusão", "Valor"]
-                st.dataframe(df_exc, use_container_width=True)
+                st.dataframe(df_exc, width="stretch")
             else:
                 st.info("Nenhum valor excluído.")
         
@@ -676,7 +690,7 @@ def main():
                     file_name="relatorio_apuracao_renda.pdf",
                     mime="application/pdf",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with col_xlsx:
                 with st.spinner("Gerando Excel..."):
@@ -686,7 +700,7 @@ def main():
                     data=xlsx_bytes,
                     file_name="apuracao_renda.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with col_csv:
                 with st.spinner("Gerando CSV..."):
@@ -696,10 +710,10 @@ def main():
                     data=csv_bytes,
                     file_name="apuracao_renda.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                 )
     
-    # Footer
+    # Footer (mantido com autoria)
     render_footer()
 
 if __name__ == "__main__":

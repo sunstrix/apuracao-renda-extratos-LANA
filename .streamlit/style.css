@@ -1,0 +1,622 @@
+/* ==========================================================================
+   Apuração de Renda via Extratos PDF — Folha de estilo dedicada
+   --------------------------------------------------------------------------
+   Este arquivo centraliza toda a customização visual da aplicação Streamlit.
+   É carregado via função load_css() no app.py, eliminando CSS inline.
+   
+   Estrutura:
+   1. Reset e variáveis CSS (tema)
+   2. Tipografia (Inter via Google Fonts)
+   3. Layout base (container, main)
+   4. Header (hero section)
+   5. Sidebar
+   6. Botões e controles
+   7. Cards de KPI (métricas)
+   8. Tabelas e data_editor
+   9. Tabs
+   10. Badges de status
+   11. Footer (autoria)
+   12. Acessibilidade e responsividade
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. RESET E VARIÁVEIS CSS (TEMA)
+   -------------------------------------------------------------------------- */
+:root {
+    /* Paleta principal — alto contraste WCAG AA/AAA */
+    --color-primary: #1E3A8A;          /* Azul profundo — botões, links, destaque */
+    --color-primary-hover: #1E40AF;    /* Azul mais claro no hover */
+    --color-primary-light: #DBEAFE;    /* Azul claro — fundos de badges */
+    --color-secondary: #3B82F6;        /* Azul médio — acentos */
+    --color-success: #059669;          /* Verde — sucesso */
+    --color-warning: #D97706;          /* Âmbar — alertas */
+    --color-danger: #DC2626;           /* Vermelho — erros */
+    
+    /* Fundos */
+    --color-bg-main: #FFFFFF;          /* Branco — fundo principal */
+    --color-bg-secondary: #F8FAFC;     /* Cinza-azulado muito claro — cards */
+    --color-bg-sidebar: #F1F5F9;       /* Cinza-azulado — sidebar */
+    --color-bg-header: #1E3A8A;        /* Azul profundo — header */
+    
+    /* Textos */
+    --color-text-primary: #1F2937;     /* Cinza-escuro — texto principal */
+    --color-text-secondary: #4B5563;   /* Cinza médio — textos secundários */
+    --color-text-muted: #6B7280;       /* Cinza claro — textos discretos */
+    --color-text-inverse: #FFFFFF;     /* Branco — texto sobre fundos escuros */
+    
+    /* Bordas e sombras */
+    --color-border: #E2E8F0;           /* Cinza claro — bordas */
+    --color-border-strong: #CBD5E1;    /* Cinza médio — bordas mais fortes */
+    --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    
+    /* Espaçamentos */
+    --spacing-xs: 0.5rem;
+    --spacing-sm: 0.75rem;
+    --spacing-md: 1rem;
+    --spacing-lg: 1.5rem;
+    --spacing-xl: 2rem;
+    --spacing-2xl: 3rem;
+    
+    /* Raios de borda */
+    --radius-sm: 0.375rem;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.75rem;
+    --radius-xl: 1rem;
+    
+    /* Transições */
+    --transition-fast: 150ms ease;
+    --transition-normal: 250ms ease;
+}
+
+/* --------------------------------------------------------------------------
+   2. TIPOGRAFIA (Inter via Google Fonts)
+   -------------------------------------------------------------------------- */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+html, body, .stApp {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: var(--color-text-primary);
+    background-color: var(--color-bg-main);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Inter', sans-serif;
+    font-weight: 700;
+    color: var(--color-text-primary);
+    letter-spacing: -0.01em;
+}
+
+h1 { font-size: 2rem; line-height: 1.2; }
+h2 { font-size: 1.5rem; line-height: 1.3; }
+h3 { font-size: 1.25rem; line-height: 1.4; }
+
+p, span, label {
+    color: var(--color-text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   3. LAYOUT BASE (container, main)
+   -------------------------------------------------------------------------- */
+.main .block-container {
+    padding-top: var(--spacing-xl);
+    padding-bottom: var(--spacing-2xl);
+    max-width: 1200px;
+}
+
+/* Remove bordas/margens padrão de dividers para dar mais espaço */
+hr {
+    margin: var(--spacing-xl) 0;
+    border-color: var(--color-border);
+}
+
+/* --------------------------------------------------------------------------
+   4. HEADER (HERO SECTION)
+   -------------------------------------------------------------------------- */
+.app-header {
+    background: linear-gradient(135deg, var(--color-bg-header) 0%, #2563EB 100%);
+    color: var(--color-text-inverse);
+    padding: var(--spacing-xl) var(--spacing-lg);
+    border-radius: var(--radius-lg);
+    margin-bottom: var(--spacing-xl);
+    box-shadow: var(--shadow-md);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--spacing-md);
+}
+
+.app-header-content {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    flex: 1;
+    min-width: 0;
+}
+
+.app-header-icon {
+    width: 48px;
+    height: 48px;
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    backdrop-filter: blur(8px);
+}
+
+.app-header-icon svg {
+    width: 28px;
+    height: 28px;
+    stroke: var(--color-text-inverse);
+    fill: none;
+    stroke-width: 2;
+}
+
+.app-header-text h1 {
+    color: var(--color-text-inverse);
+    margin: 0;
+    font-size: 1.75rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.app-header-text p {
+    color: rgba(255, 255, 255, 0.85);
+    margin: 0.25rem 0 0 0;
+    font-size: 0.95rem;
+    font-weight: 400;
+}
+
+/* --------------------------------------------------------------------------
+   5. SIDEBAR
+   -------------------------------------------------------------------------- */
+section[data-testid="stSidebar"] {
+    background-color: var(--color-bg-sidebar);
+    border-right: 1px solid var(--color-border);
+}
+
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    color: var(--color-text-primary);
+}
+
+section[data-testid="stSidebar"] .stCaption {
+    color: var(--color-text-muted);
+    font-size: 0.8rem;
+}
+
+/* --------------------------------------------------------------------------
+   6. BOTÕES E CONTROLES
+   -------------------------------------------------------------------------- */
+.stButton > button,
+.stDownloadButton > button {
+    background-color: var(--color-primary) !important;
+    color: var(--color-text-inverse) !important;
+    border: none !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 600 !important;
+    font-size: 0.9rem !important;
+    padding: 0.5rem 1rem !important;
+    transition: all var(--transition-fast) !important;
+    box-shadow: var(--shadow-sm) !important;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    background-color: var(--color-primary-hover) !important;
+    box-shadow: var(--shadow-md) !important;
+    transform: translateY(-1px);
+}
+
+.stButton > button:focus,
+.stDownloadButton > button:focus {
+    outline: 2px solid var(--color-secondary);
+    outline-offset: 2px;
+}
+
+/* Botão primário (tipo="primary") */
+.stButton > button[kind="primary"],
+button[data-testid="stBaseButton-primary"] {
+    background-color: var(--color-primary) !important;
+}
+
+/* Botão secundário */
+.stButton > button[kind="secondary"],
+button[data-testid="stBaseButton-secondary"] {
+    background-color: transparent !important;
+    color: var(--color-primary) !important;
+    border: 1px solid var(--color-primary) !important;
+}
+
+.stButton > button[kind="secondary"]:hover,
+button[data-testid="stBaseButton-secondary"]:hover {
+    background-color: var(--color-primary-light) !important;
+}
+
+/* Checkboxes */
+.stCheckbox label {
+    color: var(--color-text-primary);
+}
+
+/* File uploader */
+.stFileUploader {
+    border: 2px dashed var(--color-border-strong) !important;
+    border-radius: var(--radius-md) !important;
+    padding: var(--spacing-lg) !important;
+    transition: border-color var(--transition-fast);
+}
+
+.stFileUploader:hover {
+    border-color: var(--color-primary) !important;
+}
+
+/* --------------------------------------------------------------------------
+   7. CARDS DE KPI (MÉTRICAS)
+   -------------------------------------------------------------------------- */
+.kpi-card {
+    background-color: var(--color-bg-main);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    padding: var(--spacing-lg);
+    box-shadow: var(--shadow-sm);
+    transition: all var(--transition-normal);
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.kpi-card:hover {
+    box-shadow: var(--shadow-md);
+    border-color: var(--color-primary);
+    transform: translateY(-2px);
+}
+
+.kpi-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--spacing-sm);
+}
+
+.kpi-card-title {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0;
+}
+
+.kpi-card-icon {
+    width: 32px;
+    height: 32px;
+    background-color: var(--color-primary-light);
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.kpi-card-icon svg {
+    width: 18px;
+    height: 18px;
+    stroke: var(--color-primary);
+    fill: none;
+    stroke-width: 2;
+}
+
+.kpi-card-value {
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: var(--color-text-primary);
+    line-height: 1.2;
+    margin: var(--spacing-xs) 0;
+}
+
+.kpi-card-subtitle {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+    margin: 0;
+}
+
+/* Streamlit metric nativo — customização */
+[data-testid="stMetric"] {
+    background-color: var(--color-bg-main);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-md);
+    box-shadow: var(--shadow-sm);
+}
+
+[data-testid="stMetricLabel"] {
+    color: var(--color-text-muted) !important;
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+[data-testid="stMetricValue"] {
+    color: var(--color-text-primary) !important;
+    font-size: 1.5rem !important;
+    font-weight: 700 !important;
+}
+
+/* --------------------------------------------------------------------------
+   8. TABELAS E DATA_EDITOR
+   -------------------------------------------------------------------------- */
+.stDataFrame {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+}
+
+/* Linhas pendentes (Indeterminado) — fundo âmbar suave */
+.stDataFrame tr[data-testid="data-row-pending"] {
+    background-color: #FEF3C7 !important;
+}
+
+/* Cabeçalho de tabela */
+.stDataFrame thead {
+    background-color: var(--color-bg-secondary);
+}
+
+.stDataFrame th {
+    background-color: var(--color-bg-secondary) !important;
+    color: var(--color-text-primary) !important;
+    font-weight: 600 !important;
+    font-size: 0.85rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-bottom: 2px solid var(--color-border-strong) !important;
+}
+
+/* Células */
+.stDataFrame td {
+    color: var(--color-text-primary);
+    font-size: 0.875rem;
+    border-bottom: 1px solid var(--color-border);
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    font-weight: 600;
+    color: var(--color-text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   9. TABS
+   -------------------------------------------------------------------------- */
+.stTabs [data-baseweb="tab-list"] {
+    gap: var(--spacing-xs);
+    border-bottom: 2px solid var(--color-border);
+}
+
+.stTabs [data-baseweb="tab"] {
+    background-color: transparent;
+    color: var(--color-text-secondary);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: var(--spacing-sm) var(--spacing-md);
+    font-weight: 500;
+    font-size: 0.9rem;
+    transition: all var(--transition-fast);
+    margin-bottom: -2px;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+    color: var(--color-primary);
+    background-color: var(--color-bg-secondary);
+}
+
+.stTabs [aria-selected="true"] {
+    color: var(--color-primary) !important;
+    border-bottom-color: var(--color-primary) !important;
+    font-weight: 600;
+}
+
+/* --------------------------------------------------------------------------
+   10. BADGES DE STATUS
+   -------------------------------------------------------------------------- */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+}
+
+.badge-success {
+    background-color: #D1FAE5;
+    color: #065F46;
+}
+
+.badge-warning {
+    background-color: #FEF3C7;
+    color: #92400E;
+}
+
+.badge-info {
+    background-color: var(--color-primary-light);
+    color: var(--color-primary);
+}
+
+.badge-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: currentColor;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* --------------------------------------------------------------------------
+   11. FOOTER (AUTORIA)
+   -------------------------------------------------------------------------- */
+.app-footer {
+    margin-top: var(--spacing-2xl);
+    padding: var(--spacing-lg) 0;
+    border-top: 1px solid var(--color-border);
+    text-align: center;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+}
+
+.app-footer-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--spacing-xs);
+}
+
+.app-footer-author {
+    font-weight: 600;
+    color: var(--color-text-secondary);
+}
+
+.app-footer-links {
+    display: flex;
+    gap: var(--spacing-md);
+    align-items: center;
+    font-size: 0.8rem;
+}
+
+.app-footer-links a {
+    color: var(--color-text-muted);
+    text-decoration: none;
+    transition: color var(--transition-fast);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.app-footer-links a:hover {
+    color: var(--color-primary);
+}
+
+/* --------------------------------------------------------------------------
+   12. ACESSIBILIDADE E RESPONSIVIDADE
+   -------------------------------------------------------------------------- */
+
+/* Foco visível para navegação por teclado */
+*:focus-visible {
+    outline: 2px solid var(--color-secondary);
+    outline-offset: 2px;
+}
+
+/* Reduz animações para usuários que preferem movimento reduzido */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+/* Telas menores (tablets e mobile) */
+@media (max-width: 768px) {
+    .app-header {
+        flex-direction: column;
+        align-items: flex-start;
+        padding: var(--spacing-lg);
+    }
+    
+    .app-header-text h1 {
+        font-size: 1.4rem;
+    }
+    
+    .app-header-text p {
+        font-size: 0.85rem;
+    }
+    
+    .kpi-card-value {
+        font-size: 1.4rem;
+    }
+    
+    .main .block-container {
+        padding-top: var(--spacing-md);
+        padding-bottom: var(--spacing-lg);
+    }
+    
+    /* Stacks verticais em telas pequenas */
+    .stColumns {
+        flex-direction: column !important;
+    }
+}
+
+/* Contraste WCAG AA — garante legibilidade */
+.stAlert {
+    border-radius: var(--radius-md);
+    border-left-width: 4px;
+}
+
+.stAlert-info {
+    background-color: #EFF6FF;
+    border-left-color: var(--color-primary);
+    color: var(--color-text-primary);
+}
+
+.stAlert-success {
+    background-color: #ECFDF5;
+    border-left-color: var(--color-success);
+    color: var(--color-text-primary);
+}
+
+.stAlert-warning {
+    background-color: #FFFBEB;
+    border-left-color: var(--color-warning);
+    color: var(--color-text-primary);
+}
+
+.stAlert-error {
+    background-color: #FEF2F2;
+    border-left-color: var(--color-danger);
+    color: var(--color-text-primary);
+}
+
+/* Spinner customizado */
+.stSpinner > div {
+    border-top-color: var(--color-primary) !important;
+}
+
+/* Progress bar */
+.stProgress > div > div > div > div {
+    background-color: var(--color-primary) !important;
+}
+
+/* Status container */
+.stStatus {
+    border-radius: var(--radius-md);
+    border: 1px solid var(--color-border);
+}
+
+/* --------------------------------------------------------------------------
+   UTILITÁRIOS
+   -------------------------------------------------------------------------- */
+.text-muted { color: var(--color-text-muted); }
+.text-primary { color: var(--color-primary); }
+.text-success { color: var(--color-success); }
+.text-warning { color: var(--color-warning); }
+.text-danger { color: var(--color-danger); }
+
+.bg-light { background-color: var(--color-bg-secondary); }
+.bg-primary-light { background-color: var(--color-primary-light); }
+
+.rounded { border-radius: var(--radius-md); }
+.shadow-sm { box-shadow: var(--shadow-sm); }
+.shadow-md { box-shadow: var(--shadow-md); }

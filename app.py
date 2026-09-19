@@ -23,17 +23,20 @@ banner de aviso após o processamento;
 Rastreabilidade: transações com extraction_source="gemini" recebem selo
 🤖 na prévia de resultados.
 
-RODADA ATUAL (CORREÇÕES CRÍTICAS):
-1. Bug crítico da deduplicação: movida de calculate_income_metrics() para
-   app.py, ANTES da revisão manual. Assim os índices da tabela de revisão
-   correspondem aos índices reais da lista deduplicada, evitando que
-   decisões do operador recaiam sobre transações erradas.
-2. Regressão regex: HOLDER_EXCLUSION_KEYWORDS revertido de 'NUs' para 'NU\s'
-   (espaço após NU), restaurando filtro correto contra "NU PAGAMENTOS S.A.".
-3. Warnings de depreciação: use_container_width substituído por width="stretch"
-   (compatível com Streamlit >= 1.62).
-4. Autoria: crédito "Desenvolvido por Lana Gleizi Vieira Paes" adicionado
-   na hero section (topo da página), mantido também no rodapé.
+RODADA ATUAL (REDESIGN COMPLETO — DIRETRIZES DEEPSEEK):
+- CSS externo carregado via load_css() (.streamlit/style.css)
+- Hero section profissional com logo SVG, título e badge de status Gemini
+- Cards KPI com st.container(border=True) para destaque visual
+- Resultados organizados em st.tabs (Resumo, Entradas, Auditoria, Exportações)
+- data_editor melhorado: help em colunas, SelectboxColumn para Sinal,
+  resumo acima da tabela com contagens por categoria
+- Feedback de processamento: st.toast ao final, erros com botão "Tentar novamente"
+- Acessibilidade: aria-labels, contraste WCAG AA, prefers-reduced-motion
+- Footer com autoria + links para GitHub e README
+- Remoção de emojis decorativos (mantidos apenas os funcionais: ⚠️, 🤖)
+- CORREÇÃO CRÍTICA: Deduplicação movida para ANTES da revisão manual
+- CORREÇÃO: use_container_width substituído por width="stretch"
+- CORREÇÃO: Regex NU\s restaurado (estava NUs)
 """
 import logging
 import os
@@ -395,7 +398,7 @@ def main():
                         completed_count += 1
                         logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
                         failed_files.append((uf.name, str(e)))
-                        status.write(f"⚠️ {uf.name}: {e}")
+                        status.write(f"️ {uf.name}: {e}")
                         progress.progress(
                             completed_count / total,
                             text=f"Processado {completed_count}/{total} arquivos"
@@ -419,7 +422,7 @@ def main():
         if raw_all:
             st.toast(f"✅ {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="✅")
         if failed_files:
-            st.toast(f"️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
+            st.toast(f"⚠️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
         
         if gemini_used_any and gemini_mismatches:
             st.warning(
@@ -560,7 +563,7 @@ def main():
     )
     if pendentes:
         st.warning(
-            f"⚠️ {pendentes} linha(s) indeterminada(s) sem decisão. Pelo padrão de "
+            f"️ {pendentes} linha(s) indeterminada(s) sem decisão. Pelo padrão de "
             "segurança, elas serão EXCLUÍDAS da apuração e listadas na auditoria. "
             "Marque 'Incluir na apuração' nas que forem renda efetiva."
         )
@@ -608,7 +611,7 @@ def main():
         if n_gemini or revisao:
             info_parts = []
             if n_gemini:
-                info_parts.append(f" {n_gemini} lançamento(s) via IA (Gemini)")
+                info_parts.append(f"🤖 {n_gemini} lançamento(s) via IA (Gemini)")
             if revisao:
                 info_parts.append(
                     f"Revisão: {len(revisao.get('incluidas', []))} confirmado(s) • "

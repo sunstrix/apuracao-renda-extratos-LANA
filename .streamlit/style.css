@@ -171,6 +171,15 @@ hr {
     font-weight: 400;
 }
 
+/* RODADA ATUAL: Classe para autoria no topo da hero section */
+.app-header-author {
+    margin: 0.5rem 0 0 0;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.75);
+    font-style: italic;
+}
+
 /* --------------------------------------------------------------------------
    5. SIDEBAR
    -------------------------------------------------------------------------- */
@@ -542,6 +551,10 @@ button[data-testid="stBaseButton-secondary"]:hover {
     
     .app-header-text p {
         font-size: 0.85rem;
+    }
+    
+    .app-header-author {
+        font-size: 0.75rem;
     }
     
     .kpi-card-value {

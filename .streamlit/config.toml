@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Configuração de tema e servidor da aplicação Streamlit
+# ---------------------------------------------------------------------------
+# Este arquivo define a identidade visual padrão da aplicação, garantindo
+# consistência entre sessões e eliminando a necessidade de CSS inline no app.py.
+#
+# Paleta de cores:
+# - primaryColor (#1E3A8A): azul profundo profissional, usado em botões,
+#   links e elementos de destaque. Alto contraste com fundos claros (WCAG AA).
+# - backgroundColor (#FFFFFF): branco limpo para o fundo principal, garantindo
+#   legibilidade máxima e sensação de "documento oficial".
+# - secondaryBackgroundColor (#F1F5F9): cinza-azulado muito claro para cards,
+#   sidebars e áreas secundárias, criando hierarquia visual sutil.
+# - textColor (#1F2937): cinza-escuro (quase preto) para texto principal,
+#   garantindo contraste WCAG AAA sobre fundos claros.
+#
+# Fonte: "sans serif" é o padrão do Streamlit. A fonte Inter é carregada
+# via .streamlit/style.css para tipografia mais profissional e legível.
+# ---------------------------------------------------------------------------
+
+[theme]
+primaryColor = "#1E3A8A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#1F2937"
+font = "sans serif"
+
+[server]
+headless = true
+# Desabilita o prompt de e-mail na primeira execução (já tratado pelo executar.bat
+# via .streamlit/credentials.toml, mas reforçado aqui para consistência).
+runOnSave = false
+
+[browser]
+# Abre o navegador automaticamente na execução local (comportamento padrão
+# do executar.bat, mantido aqui para quando o app é iniciado manualmente).
+gatherUsageStats = false
+
+[client]
+# Exibe o indicador de "running" no canto superior direito durante processamento.
+showErrorDetails = true
+toolbarMode = "minimal"

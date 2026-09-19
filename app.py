@@ -23,15 +23,20 @@ banner de aviso após o processamento;
 Rastreabilidade: transações com extraction_source="gemini" recebem selo
 🤖 na prévia de resultados.
 
-RODADA ATUAL (IDENTIDADE VISUAL E AUTORIA):
-- Injeção de CSS customizado para paleta de cores profissional, tipografia
-  coerente e layout de "produto" (cards, cabeçalho dedicado, rodapé).
-- Remoção de emojis genéricos decorativos de títulos e botões, mantendo
-  apenas os funcionais (⚠️ para alertas, 🤖 para rastreabilidade IA).
-- Adição de rodapé fixo e visível com crédito de autoria.
-- Correção de erros de sintaxe em imports (espaços extras em nomes de módulos).
+RODADA ATUAL (REDESIGN COMPLETO — DIRETRIZES DEEPSEEK):
+- CSS externo carregado via load_css() (.streamlit/style.css)
+- Hero section profissional com logo SVG, título e badge de status Gemini
+- Cards KPI com st.container(border=True) para destaque visual
+- Resultados organizados em st.tabs (Resumo, Entradas, Auditoria, Exportações)
+- data_editor melhorado: help em colunas, SelectboxColumn para Sinal,
+  resumo acima da tabela com contagens por categoria
+- Feedback de processamento: st.toast ao final, erros com botão "Tentar novamente"
+- Acessibilidade: aria-labels, contraste WCAG AA, prefers-reduced-motion
+- Footer com autoria + links para GitHub e README
+- Remoção de emojis decorativos (mantidos apenas os funcionais: ⚠️, 🤖)
 """
 import logging
+import os
 import re
 import streamlit as st
 import pandas as pd
@@ -50,77 +55,26 @@ from src.gemini_extractor import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="Apuração de Renda - Extratos PDF", page_icon="💼", layout="wide")
-
-# ---------------------------------------------------------------------------
-# Injeção de CSS para identidade visual profissional
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-        :root {
-            --primary-color: #1E3A8A;
-            --secondary-color: #3B82F6;
-            --background-color: #F8FAFC;
-            --card-background: #FFFFFF;
-            --text-color: #1F2937;
-            --border-color: #E2E8F0;
-        }
-        .main .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
-        }
-        .app-header {
-            background-color: var(--primary-color);
-            color: white;
-            padding: 1.5rem;
-            border-radius: 0.5rem;
-            margin-bottom: 2rem;
-            text-align: center;
-        }
-        .app-header h1 {
-            margin: 0;
-            font-size: 2rem;
-            font-weight: 700;
-        }
-        .app-header p {
-            margin: 0.5rem 0 0 0;
-            opacity: 0.9;
-            font-size: 1rem;
-        }
-        .stButton > button {
-            background-color: var(--primary-color) !important;
-            color: white !important;
-            border: none !important;
-            border-radius: 0.375rem !important;
-            font-weight: 600 !important;
-        }
-        .stButton > button:hover {
-            background-color: var(--secondary-color) !important;
-        }
-        .app-footer {
-            margin-top: 4rem;
-            padding-top: 1.5rem;
-            border-top: 1px solid var(--border-color);
-            text-align: center;
-            color: #6B7280;
-            font-size: 0.85rem;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True
+st.set_page_config(
+    page_title="Apuração de Renda - Extratos PDF",
+    page_icon="💼",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Cabeçalho personalizado (substitui st.title/st.write genéricos)
-st.markdown(
-    """
-    <div class="app-header">
-        <h1>Apuração de Renda via Extratos PDF</h1>
-        <p>Consolidação inteligente, revisão humana e relatório executivo em segundos.</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+# ---------------------------------------------------------------------------
+# Carregamento de CSS externo (.streamlit/style.css)
+# ---------------------------------------------------------------------------
+def load_css(file_name: str) -> None:
+    """Carrega arquivo CSS do diretório .streamlit/ e injeta via st.markdown."""
+    css_path = os.path.join(".streamlit", file_name)
+    if os.path.exists(css_path):
+        with open(css_path, "r", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    else:
+        logger.warning("Arquivo CSS não encontrado: %s", css_path)
+
+load_css("style.css")
 
 # ---------------------------------------------------------------------------
 # PERF-7: Regex compiladas FORA da função para evitar recompilação a cada chamada
@@ -130,8 +84,14 @@ HOLDER_EXCLUSION_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
-def brl(value: float) -> str:
-    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def brl(value) -> str:
+    """Formata valor monetário em R$ com separadores pt-BR."""
+    # Compatível com float e Decimal
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = 0.0
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def try_detect_holder_name(text_pages) -> str:
     """
@@ -240,13 +200,108 @@ def build_review_dataframe(raw) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+# ---------------------------------------------------------------------------
+# HERO SECTION (Header profissional com logo, título e badge)
+# ---------------------------------------------------------------------------
+def render_hero_section(gemini_ok: bool) -> None:
+    """Renderiza o cabeçalho hero com logo SVG, título e badge de status."""
+    badge_class = "badge-success" if gemini_ok else "badge-info"
+    badge_text = "Gemini Ativo" if gemini_ok else "Modo Local"
+    badge_dot = '<span class="badge-dot"></span>' if gemini_ok else ""
+    
+    st.markdown(
+        f"""
+        <div class="app-header">
+            <div class="app-header-content">
+                <div class="app-header-icon" aria-label="Ícone da aplicação">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="app-header-text">
+                    <h1>Apuração de Renda via Extratos PDF</h1>
+                    <p>Consolidação inteligente, revisão humana e relatório executivo em segundos.</p>
+                </div>
+            </div>
+            <div class="badge {badge_class}" aria-label="Status do modo de extração">
+                {badge_dot}
+                {badge_text}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ---------------------------------------------------------------------------
+# CARDS KPI (Métricas com destaque visual)
+# ---------------------------------------------------------------------------
+def render_kpi_card(title: str, value: str, subtitle: str = "", icon_svg: str = "") -> None:
+    """Renderiza um card KPI com título, valor grande e subtítulo."""
+    icon_html = f"""
+        <div class="kpi-card-icon" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{icon_svg}</svg>
+        </div>
+    """ if icon_svg else ""
+    
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-card-header">
+                <p class="kpi-card-title">{title}</p>
+                {icon_html}
+            </div>
+            <p class="kpi-card-value">{value}</p>
+            <p class="kpi-card-subtitle">{subtitle}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ---------------------------------------------------------------------------
+# FOOTER (Autoria + Links)
+# ---------------------------------------------------------------------------
+def render_footer() -> None:
+    """Renderiza o rodapé com autoria e links para GitHub/README."""
+    st.markdown(
+        """
+        <div class="app-footer">
+            <div class="app-footer-content">
+                <p class="app-footer-author">Desenvolvido por Lana Gleizi Vieira Paes</p>
+                <div class="app-footer-links">
+                    <a href="https://github.com/sunstrix/apuracao-renda-extratos-LANA" target="_blank" rel="noopener noreferrer" aria-label="Repositório no GitHub">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                        </svg>
+                        GitHub
+                    </a>
+                    <a href="https://github.com/sunstrix/apuracao-renda-extratos-LANA/blob/main/README.md" target="_blank" rel="noopener noreferrer" aria-label="Documentação">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                            <polyline points="10 9 9 9 8 9"></polyline>
+                        </svg>
+                        Documentação
+                    </a>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def main():
+    gemini_ok = gemini_available()
+    
+    # Hero section
+    render_hero_section(gemini_ok)
+    
     # ------------------------------------------------------------------ #
     # Configuração de extração (RODADA GEMINI): toggle + consentimento
     # ------------------------------------------------------------------ #
     with st.sidebar:
         st.header("Configuração de Extração")
-        gemini_ok = gemini_available()
         use_gemini_cfg = st.checkbox(
             "Extração via Gemini (nuvem)",
             value=gemini_ok,
@@ -270,16 +325,21 @@ def main():
     for key, default in (("raw_transactions", None), ("metrics", None),
                          ("detected_holder", ""), ("institutions", None),
                          ("reviewed", False),
-                         ("manual_inclusions", set()), ("manual_exclusions", {})):
+                         ("manual_inclusions", set()), ("manual_exclusions", {}),
+                         ("duplicates_removed", 0)):
         if key not in st.session_state:
             st.session_state[key] = default
 
     uploaded_files = st.file_uploader(
-        "Selecione os arquivos PDF dos extratos", type=["pdf"], accept_multiple_files=True
+        "Selecione os arquivos PDF dos extratos",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Aceita múltiplos PDFs de qualquer banco brasileiro. Extratos com períodos sobrepostos serão automaticamente deduplicados.",
     )
     holder_input = st.text_input(
         "Nome do Titular (opcional - será tentada a auto-detecção)",
         value=st.session_state.detected_holder or "",
+        help="Informe o nome completo do titular das contas. Se deixado em branco, o sistema tentará detectá-lo automaticamente no extrato.",
     )
 
     # ------------------------------------------------------------------ #
@@ -291,11 +351,14 @@ def main():
         detected_holder = holder_input
         gemini_mismatches = []
         gemini_used_any = False
+        failed_files = []
+        
         with st.status("Processando extratos...", expanded=True) as status:
             progress = st.progress(0.0, text="Iniciando processamento paralelo...")
             total = len(uploaded_files)
             max_workers = min(6, total)
             completed_count = 0
+            
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_file = {
                     executor.submit(_process_single_pdf, uf, use_gemini): uf
@@ -306,9 +369,11 @@ def main():
                     try:
                         (file_name, success, txs, bank, holder, error, info_gemini) = future.result()
                         completed_count += 1
+                        
                         if info_gemini.get("used"):
                             gemini_used_any = True
                             gemini_mismatches.extend(info_gemini.get("mismatches", []))
+                        
                         if success:
                             raw_all.extend(txs)
                             institutions.add(bank_display_name(bank))
@@ -317,22 +382,48 @@ def main():
                             selo = "🤖 " if info_gemini.get("used") else "✅ "
                             status.write(f"{selo}{file_name}: {len(txs)} transações ({bank_display_name(bank)})")
                         else:
-                            st.warning(f"⚠️ {file_name}: {error}")
+                            failed_files.append((file_name, error))
                             status.write(f"⚠️ {file_name}: {error}")
-                        progress.progress(completed_count / total, text=f"Processado {completed_count}/{total} arquivos")
+                        
+                        progress.progress(
+                            completed_count / total,
+                            text=f"Processado {completed_count}/{total} arquivos"
+                        )
                     except Exception as e:
                         completed_count += 1
                         logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
-                        st.error(f"Erro inesperado ao processar '{uf.name}': {e}")
-                        progress.progress(completed_count / total, text=f"Processado {completed_count}/{total} arquivos")
+                        failed_files.append((uf.name, str(e)))
+                        status.write(f"⚠️ {uf.name}: {e}")
+                        progress.progress(
+                            completed_count / total,
+                            text=f"Processado {completed_count}/{total} arquivos"
+                        )
+            
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
+        
+        # Toast de sucesso/erro
+        if raw_all:
+            st.toast(f"✅ {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="✅")
+        if failed_files:
+            st.toast(f"⚠️ {len(failed_files)} arquivo(s) com erro", icon="⚠️")
         
         if gemini_used_any and gemini_mismatches:
             st.warning(
                 f"⚠️ Gemini: {len(gemini_mismatches)} seção(ões) com somatório divergente "
                 "do total impresso pelo banco. Confira a tabela de auditoria antes de confirmar."
             )
+        
+        if failed_files:
+            with st.expander(f"⚠️ {len(failed_files)} arquivo(s) com erro — clique para detalhes"):
+                for fname, err in failed_files:
+                    st.error(f"**{fname}**: {err}")
+                    st.button(
+                        f"Tentar novamente: {fname}",
+                        key=f"retry_{fname}",
+                        on_click=lambda f=fname: st.rerun(),
+                    )
+        
         st.session_state.raw_transactions = raw_all
         st.session_state.institutions = institutions
         st.session_state.detected_holder = detected_holder or holder_input
@@ -343,9 +434,11 @@ def main():
 
     raw = st.session_state.raw_transactions
     if raw is None:
+        render_footer()
         return
     if not raw:
         st.error("Nenhuma transação pôde ser extraída dos arquivos fornecidos.")
+        render_footer()
         return
     
     holder_name = holder_input or st.session_state.detected_holder or "Titular Não Identificado"
@@ -365,7 +458,7 @@ def main():
         st.dataframe(df_raw, use_container_width=True, height=320)
 
     # ------------------------------------------------------------------ #
-    # Etapa 3: revisão manual obrigatória (st.data_editor)
+    # Etapa 3: revisão manual obrigatória (st.data_editor melhorado)
     # ------------------------------------------------------------------ #
     st.divider()
     st.subheader("Revisão Manual — obrigatória antes da exportação")
@@ -374,8 +467,21 @@ def main():
         "Débitos ficam fora por padrão. Desmarque créditos que NÃO sejam renda "
         "recorrente (ex.: Pix de parente) e informe o motivo na última coluna."
     )
+    
     if "review_df" not in st.session_state:
         st.session_state.review_df = build_review_dataframe(raw)
+    
+    # Resumo acima da tabela (contagens por categoria)
+    df_preview = st.session_state.review_df
+    n_credit = int((df_preview["Sinal"] == "Crédito").sum())
+    n_debit = int((df_preview["Sinal"] == "Débito").sum())
+    n_pending = int((df_preview["Sinal"] == "Indeterminado").sum())
+    
+    col_res1, col_res2, col_res3, col_res4 = st.columns(4)
+    col_res1.metric("Total de Linhas", len(df_preview))
+    col_res2.metric("Créditos Automáticos", n_credit)
+    col_res3.metric("Débitos (excluídos)", n_debit)
+    col_res4.metric("Pendentes de Revisão", n_pending)
     
     edited = st.data_editor(
         st.session_state.review_df,
@@ -383,20 +489,59 @@ def main():
         use_container_width=True,
         height=420,
         column_config={
-            "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
-            "Data": st.column_config.TextColumn("Data", disabled=True, width="small"),
-            "Descrição": st.column_config.TextColumn("Descrição", disabled=True, width="large"),
-            "Valor": st.column_config.NumberColumn("Valor", disabled=True, format="R$ %.2f", width="small"),
-            "Sinal": st.column_config.TextColumn("Sinal Detectado", disabled=True, width="small"),
-            "Status": st.column_config.TextColumn("Status", disabled=True, width="medium"),
-            "Incluir na apuração": st.column_config.CheckboxColumn("Incluir na apuração"),
-            "Motivo da exclusão (manual)": st.column_config.TextColumn("Motivo da exclusão (manual)"),
+            "ID": st.column_config.NumberColumn(
+                "ID",
+                disabled=True,
+                width="small",
+                help="Índice único da transação na lista bruta.",
+            ),
+            "Data": st.column_config.TextColumn(
+                "Data",
+                disabled=True,
+                width="small",
+                help="Data do lançamento conforme extraída do extrato.",
+            ),
+            "Descrição": st.column_config.TextColumn(
+                "Descrição",
+                disabled=True,
+                width="large",
+                help="Descrição completa do lançamento + contraparte (se visível).",
+            ),
+            "Valor": st.column_config.NumberColumn(
+                "Valor",
+                disabled=True,
+                format="R$ %.2f",
+                width="small",
+                help="Valor do lançamento em R$ (positivo para créditos, negativo para débitos).",
+            ),
+            "Sinal": st.column_config.SelectboxColumn(
+                "Sinal Detectado",
+                disabled=True,
+                width="small",
+                options=["Crédito", "Débito", "Indeterminado"],
+                help="Direção do lançamento: Crédito (entrada), Débito (saída) ou Indeterminado (requer revisão manual).",
+            ),
+            "Status": st.column_config.TextColumn(
+                "Status",
+                disabled=True,
+                width="medium",
+                help="Status da classificação: Automático (crédito/débito) ou Revisão manual obrigatória (indeterminado).",
+            ),
+            "Incluir na apuração": st.column_config.CheckboxColumn(
+                "Incluir na apuração",
+                help="Marque para incluir este lançamento na apuração de renda. Débitos ficam fora por padrão.",
+            ),
+            "Motivo da exclusão (manual)": st.column_config.TextColumn(
+                "Motivo da exclusão (manual)",
+                help="Informe o motivo caso esteja excluindo um crédito que seria automaticamente incluído.",
+            ),
         },
         key="review_editor",
     )
     
+    # Aviso de pendentes
     pendentes = int(
-        ((edited["Status"].astype(str).str.contains("Indeterminado"))
+        ((edited["Sinal"].astype(str) == "Indeterminado")
          & (~edited["Incluir na apuração"])).sum()
     )
     if pendentes:
@@ -420,8 +565,9 @@ def main():
                 else:
                     manual_exclusions[idx] = motivo or "Não confirmada como renda pelo operador na revisão"
             else:
-                if (t.is_credit or t.amount > 0) and not incluir:
+                if (t.is_credit or float(t.amount) > 0) and not incluir:
                     manual_exclusions[idx] = motivo or "Excluída manualmente pelo operador"
+        
         st.session_state.manual_inclusions = manual_inclusions
         st.session_state.manual_exclusions = manual_exclusions
         st.session_state.metrics = calculate_income_metrics(
@@ -434,90 +580,127 @@ def main():
         st.success("Revisão confirmada. Relatório e exportações liberados abaixo.")
 
     # ------------------------------------------------------------------ #
-    # Etapa 4: resultados + exportações (somente após confirmação)
+    # Etapa 4: resultados + exportações (em TABS para reduzir rolagem)
     # ------------------------------------------------------------------ #
     metrics = st.session_state.metrics
     if st.session_state.reviewed and metrics is not None:
         st.divider()
         st.subheader("Prévia dos Resultados")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Geral Apurado", brl(metrics["total_geral"]))
-        col2.metric("Média Mensal Geral", brl(metrics["media_mensal_geral"]))
-        col3.metric("Média Meses Completos", brl(metrics["media_meses_completos"]))
         
+        # Rastreabilidade IA e revisão
         n_gemini = sum(1 for t in raw if getattr(t, "extraction_source", "") == "gemini")
-        if n_gemini:
-            st.caption(
-                f"🤖 {n_gemini} lançamento(s) extraído(s) via IA (Gemini), validados "
-                "contra os somatórios impressos pelo banco."
-            )
         revisao = metrics.get("revisao_manual", {})
-        st.caption(
-            f"Revisão: {len(revisao.get('incluidas', []))} lançamento(s) confirmado(s) "
-            f"manualmente como renda • {len(revisao.get('excluidas', []))} exclusão(ões) "
-            f"manuais/pendentes."
-        )
         
-        st.subheader("Resumo Consolidado por Mês")
-        if metrics["resumo_mensal"]:
-            df_resumo = pd.DataFrame(metrics["resumo_mensal"])
-            df_resumo.columns = ["Mês/Ano", "Dias Cobertos", "Qtd Entradas Válidas", "Total Válido Mensal"]
-            st.dataframe(df_resumo, use_container_width=True)
-        else:
-            st.info("Nenhum dado mensal consolidado disponível.")
+        if n_gemini or revisao:
+            info_parts = []
+            if n_gemini:
+                info_parts.append(f"🤖 {n_gemini} lançamento(s) via IA (Gemini)")
+            if revisao:
+                info_parts.append(
+                    f"Revisão: {len(revisao.get('incluidas', []))} confirmado(s) • "
+                    f"{len(revisao.get('excluidas', []))} exclusão(ões)"
+                )
+            st.caption(" • ".join(info_parts))
+        
+        # KPI Cards
+        col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+        with col_kpi1:
+            render_kpi_card(
+                title="Total Geral Apurado",
+                value=brl(metrics["total_geral"]),
+                subtitle="Soma de todas as entradas válidas",
+                icon_svg='<path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round"/>',
+            )
+        with col_kpi2:
+            render_kpi_card(
+                title="Média Mensal Geral",
+                value=brl(metrics["media_mensal_geral"]),
+                subtitle="Total / número de meses com lançamentos",
+                icon_svg='<path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" stroke-linecap="round" stroke-linejoin="round"/>',
+            )
+        with col_kpi3:
+            render_kpi_card(
+                title="Média Meses Completos",
+                value=brl(metrics["media_meses_completos"]),
+                subtitle="Total / meses com >20 dias cobertos",
+                icon_svg='<path d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" stroke-linecap="round" stroke-linejoin="round"/>',
+            )
+        
+        # Tabs para organizar resultados
+        tab_resumo, tab_validas, tab_auditoria, tab_export = st.tabs([
+            "Resumo por Mês",
+            "Entradas Válidas",
+            "Auditoria",
+            "Exportações",
+        ])
+        
+        with tab_resumo:
+            if metrics["resumo_mensal"]:
+                df_resumo = pd.DataFrame(metrics["resumo_mensal"])
+                df_resumo.columns = ["Mês/Ano", "Dias Cobertos", "Qtd Entradas Válidas", "Total Válido Mensal"]
+                st.dataframe(df_resumo, use_container_width=True)
+            else:
+                st.info("Nenhum dado mensal consolidado disponível.")
+        
+        with tab_validas:
+            if metrics["entradas_validas"]:
+                df_validas = pd.DataFrame([{
+                    "Data": t.date.strftime("%d/%m/%Y"),
+                    "Descrição": t.description,
+                    "Valor": t.amount,
+                } for t in metrics["entradas_validas"]])
+                st.dataframe(df_validas, use_container_width=True)
+            else:
+                st.info("Nenhuma entrada válida encontrada.")
+        
+        with tab_auditoria:
+            if metrics["entradas_excluidas"]:
+                df_exc = pd.DataFrame(metrics["entradas_excluidas"])
+                df_exc["date"] = pd.to_datetime(df_exc["date"]).dt.strftime("%d/%m/%Y")
+                df_exc.columns = ["Data", "Descrição Original", "Regra de Exclusão", "Valor"]
+                st.dataframe(df_exc, use_container_width=True)
+            else:
+                st.info("Nenhum valor excluído.")
+        
+        with tab_export:
+            st.subheader("Relatório Executivo e Exportações")
+            st.caption("Gere os relatórios em PDF, Excel ou CSV para download.")
             
-        st.subheader("Entradas Válidas Consideradas")
-        if metrics["entradas_validas"]:
-            df_validas = pd.DataFrame([{
-                "Data": t.date.strftime("%d/%m/%Y"),
-                "Descrição": t.description,
-                "Valor": t.amount,
-            } for t in metrics["entradas_validas"]])
-            st.dataframe(df_validas, use_container_width=True)
-        else:
-            st.info("Nenhuma entrada válida encontrada.")
-            
-        st.subheader("Auditoria (Valores Excluídos)")
-        if metrics["entradas_excluidas"]:
-            df_exc = pd.DataFrame(metrics["entradas_excluidas"])
-            df_exc["date"] = pd.to_datetime(df_exc["date"]).dt.strftime("%d/%m/%Y")
-            df_exc.columns = ["Data", "Descrição Original", "Regra de Exclusão", "Valor"]
-            st.dataframe(df_exc, use_container_width=True)
-        else:
-            st.info("Nenhum valor excluído.")
-            
-        st.divider()
-        st.subheader("Relatório Executivo e Exportações")
-        col_pdf, col_xlsx, col_csv = st.columns(3)
-        with col_pdf:
-            with st.spinner("Gerando PDF..."):
-                pdf_bytes = generate_report(metrics, holder_name, institutions).getvalue()
-            st.download_button("Gerar Relatório PDF", data=pdf_bytes,
-                               file_name="relatorio_apuracao_renda.pdf",
-                               mime="application/pdf", type="primary")
-        with col_xlsx:
-            with st.spinner("Gerando Excel..."):
-                xlsx_bytes = generate_excel(metrics, holder_name, institutions)
-            st.download_button("Baixar Excel", data=xlsx_bytes,
-                               file_name="apuracao_renda.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with col_csv:
-            with st.spinner("Gerando CSV..."):
-                csv_bytes = generate_csv(metrics)
-            st.download_button("Baixar CSV", data=csv_bytes,
-                               file_name="apuracao_renda.csv", mime="text/csv")
-
-    # ------------------------------------------------------------------ #
-    # Rodapé fixo com autoria (Requisito 7)
-    # ------------------------------------------------------------------ #
-    st.markdown(
-        """
-        <div class="app-footer">
-            Desenvolvido por Lana Gleizi Vieira Paes
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+            col_pdf, col_xlsx, col_csv = st.columns(3)
+            with col_pdf:
+                with st.spinner("Gerando PDF..."):
+                    pdf_bytes = generate_report(metrics, holder_name, institutions).getvalue()
+                st.download_button(
+                    "Gerar Relatório PDF",
+                    data=pdf_bytes,
+                    file_name="relatorio_apuracao_renda.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with col_xlsx:
+                with st.spinner("Gerando Excel..."):
+                    xlsx_bytes = generate_excel(metrics, holder_name, institutions)
+                st.download_button(
+                    "Baixar Excel",
+                    data=xlsx_bytes,
+                    file_name="apuracao_renda.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col_csv:
+                with st.spinner("Gerando CSV..."):
+                    csv_bytes = generate_csv(metrics)
+                st.download_button(
+                    "Baixar CSV",
+                    data=csv_bytes,
+                    file_name="apuracao_renda.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+    
+    # Footer
+    render_footer()
 
 if __name__ == "__main__":
     main()

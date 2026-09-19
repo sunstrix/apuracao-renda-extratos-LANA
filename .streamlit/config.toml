@@ -1,6 +1,6 @@
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # Configuração de tema e servidor da aplicação Streamlit
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # Este arquivo define a identidade visual padrão da aplicação, garantindo
 # consistência entre sessões e eliminando a necessidade de CSS inline no app.py.
 #
@@ -16,7 +16,7 @@
 #
 # Fonte: "sans serif" é o padrão do Streamlit. A fonte Inter é carregada
 # via .streamlit/style.css para tipografia mais profissional e legível.
-# ---------------------------------------------------------------------------
+# ==========================================================================
 
 [theme]
 primaryColor = "#1E3A8A"
@@ -30,6 +30,8 @@ headless = true
 # Desabilita o prompt de e-mail na primeira execução (já tratado pelo executar.bat
 # via .streamlit/credentials.toml, mas reforçado aqui para consistência).
 runOnSave = false
+enableCORS = false
+enableXsrfProtection = true
 
 [browser]
 # Abre o navegador automaticamente na execução local (comportamento padrão

@@ -11,7 +11,6 @@ coluna "Motivo da exclusão (manual)";
 botão "Confirmar revisão e gerar relatório" -> calculate_income_metrics()
 recebendo manual_exclusions / manual_inclusions;
 downloads PDF / Excel / CSV habilitados somente após a confirmação.
-
 RODADA GEMINI (integração híbrida):
 Toggle "Extração via Gemini (nuvem)" no sidebar — habilitado apenas com
 GEMINI_API_KEY configurada (.env / secrets do Cloud);
@@ -22,8 +21,11 @@ Divergências do gabarito (somatórios do banco vs extração IA) viram
 banner de aviso após o processamento;
 Rastreabilidade: transações com extraction_source="gemini" recebem selo
 🤖 na prévia de resultados.
-
 RODADA ATUAL (CORREÇÕES CRÍTICAS):
+BUG 1 FIX: render_kpi_card substituído por st.metric nativo (estilizado via
+CSS externo) — elimina definitivamente o problema de HTML cru renderizado.
+BUG 3 FIX: try/except explícito na geração do PDF + brl() reescrito para
+suportar Decimal nativamente (sem perda de precisão).
 Bug crítico da deduplicação: movida de calculate_income_metrics() para
 app.py, ANTES da revisão manual. Assim os índices da tabela de revisão
 correspondem aos índices reais da lista deduplicada, evitando que
@@ -41,6 +43,7 @@ import os
 import re
 import streamlit as st
 import pandas as pd
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.pdf_extractor import extract_text_from_pdf
 from src.bank_detector import detect_bank, bank_display_name
@@ -87,12 +90,21 @@ HOLDER_EXCLUSION_KEYWORDS = re.compile(
 )
 
 def brl(value) -> str:
-    """Formata valor monetário em R$ com separadores pt-BR."""
+    """
+    Formata valor monetário em R$ com separadores pt-BR.
+    BUG 3 FIX: Suporta Decimal nativamente (sem conversão para float).
+    """
     try:
-        v = float(value)
-    except (TypeError, ValueError):
-        v = 0.0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if isinstance(value, Decimal):
+            v = value
+        else:
+            v = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        v = Decimal('0.00')
+    
+    # Formata com 2 casas decimais e separadores pt-BR
+    formatted = f"{v:,.2f}"
+    return f"R$ {formatted}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def try_detect_holder_name(text_pages) -> str:
     """
@@ -103,6 +115,7 @@ def try_detect_holder_name(text_pages) -> str:
     lines = []
     for page in (text_pages or [])[:2]:
         lines.extend((page or "").splitlines())
+    
     for idx, line in enumerate(lines):
         if "CPF" not in line:
             continue
@@ -126,11 +139,12 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
     Processa um único PDF e retorna os resultados.
     Roteamento (RODADA GEMINI):
     1) se use_gemini: detecta o banco via leitura parcial do texto,
-       tenta a API Gemini (PDF nativo, sem OCR local);
-       erro controlado ou 0 transações => cai no passo 2;
+    tenta a API Gemini (PDF nativo, sem OCR local);
+    erro controlado ou 0 transações => cai no passo 2;
     2) pipeline local determinístico (PyMuPDF/pdfplumber/OCR + parsers).
     """
     info_gemini = {"used": False, "mismatches": []}
+    
     # --- Caminho 1: Gemini (nuvem), somente se autorizado pelo operador ---
     if use_gemini:
         try:
@@ -142,6 +156,7 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 bank = detect_bank(full_text_preview)
             except Exception:
                 bank = "generic"
+            
             txs, data, mismatches = extract_transactions_via_gemini(
                 pdf_bytes, uploaded_file.name, bank
             )
@@ -150,6 +165,7 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 info_gemini["used"] = True
                 info_gemini["mismatches"] = mismatches
                 return (uploaded_file.name, True, txs, bank, holder, None, info_gemini)
+            
             logger.warning(
                 "Gemini retornou 0 transações para %s; usando fallback local.",
                 uploaded_file.name,
@@ -159,6 +175,7 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 "Gemini indisponível/erro em %s (%s); usando fallback local.",
                 uploaded_file.name, ge,
             )
+    
     # --- Caminho 2: pipeline local determinístico (fallback garantido) ---
     try:
         uploaded_file.seek(0)
@@ -167,6 +184,7 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
             return (uploaded_file.name, False, [], None, None,
                     "Arquivo não pôde ser lido (protegido por senha, corrompido ou sem camada de texto)",
                     info_gemini)
+        
         full_text = "\n".join(pages)
         bank = detect_bank(full_text)
         detected_holder = try_detect_holder_name(pages)
@@ -189,6 +207,7 @@ def build_review_dataframe(raw) -> pd.DataFrame:
             sinal, incluir, status = "Crédito", True, "Automático"
         else:
             sinal, incluir, status = "Débito", False, "Automático (fora da renda)"
+        
         rows.append({
             "ID": idx,
             "Data": t.date.strftime("%d/%m/%Y"),
@@ -235,31 +254,6 @@ def render_hero_section(gemini_ok: bool) -> None:
     )
 
 # ---------------------------------------------------------------------------
-# CARDS KPI (Métricas com destaque visual)
-# ---------------------------------------------------------------------------
-def render_kpi_card(title: str, value: str, subtitle: str = "", icon_svg: str = "") -> None:
-    """Renderiza um card KPI com título, valor grande e subtítulo."""
-    icon_html = f"""
-        <div class="kpi-card-icon" aria-hidden="true">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{icon_svg}</svg>
-        </div>
-    """ if icon_svg else ""
-    
-    st.markdown(
-        f"""
-        <div class="kpi-card">
-            <div class="kpi-card-header">
-                <p class="kpi-card-title">{title}</p>
-                {icon_html}
-            </div>
-            <p class="kpi-card-value">{value}</p>
-            <p class="kpi-card-subtitle">{subtitle}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------------------------------------------------------
 # FOOTER (Autoria + Links)
 # ---------------------------------------------------------------------------
 def render_footer() -> None:
@@ -272,7 +266,7 @@ def render_footer() -> None:
                 <div class="app-footer-links">
                     <a href="https://github.com/sunstrix/apuracao-renda-extratos-LANA" target="_blank" rel="noopener noreferrer" aria-label="Repositório no GitHub">
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                            <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.8 4 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
                         </svg>
                         GitHub
                     </a>
@@ -611,7 +605,7 @@ def main():
         if n_gemini or revisao:
             info_parts = []
             if n_gemini:
-                info_parts.append(f"\U0001F916 {n_gemini} lançamento(s) via IA (Gemini)")  # 
+                info_parts.append(f"\U0001F916 {n_gemini} lançamento(s) via IA (Gemini)")  # 🤖
             if revisao:
                 info_parts.append(
                     f"Revisão: {len(revisao.get('incluidas', []))} confirmado(s) • "
@@ -619,28 +613,25 @@ def main():
                 )
             st.caption(" • ".join(info_parts))
         
-        # KPI Cards
+        # BUG 1 FIX: KPI Cards usando st.metric nativo (estilizado via CSS)
         col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
         with col_kpi1:
-            render_kpi_card(
-                title="Total Geral Apurado",
+            st.metric(
+                label="Total Geral Apurado",
                 value=brl(metrics["total_geral"]),
-                subtitle="Soma de todas as entradas válidas",
-                icon_svg='<path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round"/>',
+                help="Soma de todas as entradas válidas",
             )
         with col_kpi2:
-            render_kpi_card(
-                title="Média Mensal Geral",
+            st.metric(
+                label="Média Mensal Geral",
                 value=brl(metrics["media_mensal_geral"]),
-                subtitle="Total / número de meses com lançamentos",
-                icon_svg='<path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" stroke-linecap="round" stroke-linejoin="round"/>',
+                help="Total / número de meses com lançamentos",
             )
         with col_kpi3:
-            render_kpi_card(
-                title="Média Meses Completos",
+            st.metric(
+                label="Média Meses Completos",
                 value=brl(metrics["media_meses_completos"]),
-                subtitle="Total / meses com >20 dias cobertos",
-                icon_svg='<path d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" stroke-linecap="round" stroke-linejoin="round"/>',
+                help="Total / meses com >20 dias cobertos",
             )
         
         # Tabs para organizar resultados
@@ -685,36 +676,52 @@ def main():
             
             col_pdf, col_xlsx, col_csv = st.columns(3)
             with col_pdf:
-                with st.spinner("Gerando PDF..."):
-                    pdf_bytes = generate_report(metrics, holder_name, institutions).getvalue()
-                st.download_button(
-                    "Gerar Relatório PDF",
-                    data=pdf_bytes,
-                    file_name="relatorio_apuracao_renda.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    width="stretch",
-                )
+                # BUG 3 FIX: try/except explícito na geração do PDF
+                try:
+                    with st.spinner("Gerando PDF..."):
+                        pdf_buffer = generate_report(metrics, holder_name, institutions)
+                        pdf_bytes = pdf_buffer.getvalue()
+                    st.download_button(
+                        "Gerar Relatório PDF",
+                        data=pdf_bytes,
+                        file_name="relatorio_apuracao_renda.pdf",
+                        mime="application/pdf",
+                        type="primary",
+                        width="stretch",
+                    )
+                except Exception as e:
+                    logger.error("Erro ao gerar PDF: %s", e, exc_info=True)
+                    st.error(f"Erro ao gerar PDF: {str(e)}")
+            
             with col_xlsx:
-                with st.spinner("Gerando Excel..."):
-                    xlsx_bytes = generate_excel(metrics, holder_name, institutions)
-                st.download_button(
-                    "Baixar Excel",
-                    data=xlsx_bytes,
-                    file_name="apuracao_renda.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
+                try:
+                    with st.spinner("Gerando Excel..."):
+                        xlsx_bytes = generate_excel(metrics, holder_name, institutions)
+                    st.download_button(
+                        "Baixar Excel",
+                        data=xlsx_bytes,
+                        file_name="apuracao_renda.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
+                    )
+                except Exception as e:
+                    logger.error("Erro ao gerar Excel: %s", e, exc_info=True)
+                    st.error(f"Erro ao gerar Excel: {str(e)}")
+            
             with col_csv:
-                with st.spinner("Gerando CSV..."):
-                    csv_bytes = generate_csv(metrics)
-                st.download_button(
-                    "Baixar CSV",
-                    data=csv_bytes,
-                    file_name="apuracao_renda.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
+                try:
+                    with st.spinner("Gerando CSV..."):
+                        csv_bytes = generate_csv(metrics)
+                    st.download_button(
+                        "Baixar CSV",
+                        data=csv_bytes,
+                        file_name="apuracao_renda.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+                except Exception as e:
+                    logger.error("Erro ao gerar CSV: %s", e, exc_info=True)
+                    st.error(f"Erro ao gerar CSV: {str(e)}")
     
     # Footer (mantido com autoria)
     render_footer()

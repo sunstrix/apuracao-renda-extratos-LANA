@@ -1,59 +1,56 @@
 """
 Consolidação das métricas de apuração de renda.
+
 Responsabilidades:
 - Classificar cada lançamento via rules_engine.evaluate_transaction();
 - Aplicar a camada de revisão manual do operador CCA:
-  * manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
-  * manual_inclusions: {índices originais} — confirmação de lançamentos
-    "needs_review" como renda pelo operador;
-  * needs_review SEM decisão → excluído por padrão de segurança com motivo
-    "Sinal de crédito/débito indeterminado — revisão manual pendente"
-    (default "manter segurança" validado com o titular do projeto);
-- Agregar totais mensais, Total Geral, Média Mensal Geral e Média de Meses
-  Completos;
+    * manual_exclusions: {índice original: motivo} — exclusão com prioridade máxima;
+    * manual_inclusions: {índices originais} — confirmação de lançamentos
+      "needs_review" como renda pelo operador;
+    * needs_review SEM decisão → excluído por padrão de segurança com motivo
+      "Sinal de crédito/débito indeterminado — revisão manual pendente"
+      (default "manter segurança" validado com o titular do projeto);
+- Agregar totais mensais, Total Geral, Média Mensal Geral e Média de Meses Completos;
 - FIX C (rodada 2): produzir a chave "revisao_manual" no retorno, com os
-  índices de lançamentos incluídos/excluídos/pendentes da revisão manual —
-  o app.py já lia metrics["revisao_manual"] mas esta chave nunca existiu,
-  fazendo o caption de revisão mostrar sempre 0/0.
+  índices de lançamentos incluídos/excluídos/pendentes da revisão manual.
+
+=============================================================================
+⚠️  SALVAGUARDA CRÍTICA DE ARQUITETURA (BUG 4 — NÃO REMOVER)
+=============================================================================
+A deduplicação de transações é feita EXCLUSIVAMENTE no app.py, ANTES da
+revisão manual. Esta função NUNCA deve chamar deduplicate_transactions()
+internamente, pois:
+
+1. Os índices da tabela de revisão (ID) correspondem à lista `raw`
+   pós-deduplicação do app.py;
+2. manual_exclusions e manual_inclusions usam esses mesmos índices;
+3. Se deduplicarmos aqui novamente, os índices mudam e as decisões do
+   operador recaem sobre transações ERRADAS (silenciosamente).
+
+Contrato desta função: recebe a lista JÁ DEDUPLICADA e JÁ ORDENADA.
+Qualquer mudança nesse contrato exige revisão do app.py em conjunto.
+=============================================================================
 
 CORREÇÃO DE LÓGICA (Rodada Atual):
-- "Média Meses Completos" agora é calculada como:
-  Total Geral / número de meses com mais de 20 dias de extrato cobertos.
-  (Anteriormente, fazia a média aritmética das somas dos meses completos,
-  o que gerava um valor idêntico à média geral em muitos casos).
-- "Dias Cobertos" por mês agora é calculado explicitamente e enviado no
-  resumo_mensal, permitindo que o relatório exiba a cobertura real do
-  extrato (ex: 01/03 a 31/03 = 31 dias).
+- "Média Meses Completos" = Total Geral / meses com >20 dias cobertos.
+- "Dias Cobertos" por mês calculado explicitamente no resumo_mensal.
 
-Limpeza massiva de sintaxe (strings com espaços extras, __name__ incorreto).
+RODADA DECIMAL:
+- Migração completa para decimal.Decimal em todos os cálculos financeiros.
+- Todos os valores de retorno são Decimal com precisão de 2 casas.
 
-O formato de retorno é mantido (mesmas chaves do contrato original) + a
-nova chave "revisao_manual" + "dias_cobertos" no resumo mensal.
-
-PERF-8/9/10: Otimizações aplicadas:
-- Redução de passes sobre a lista de transações (agrupamento em 1 passagem)
-- Estruturas defaultdict pré-inicializadas
-- Soma de valores otimizada com sum() sobre generators
-
-RODADA DECIMAL (Correção Crítica de Precisão):
-- Migração de float para decimal.Decimal em todos os cálculos financeiros,
-  eliminando erros de arredondamento IEEE 754 em somas sucessivas.
-- Todos os valores de retorno (total_geral, media_mensal_geral, etc.) agora
-  são Decimal com precisão de 2 casas decimais.
-
-RODADA DEDUPLICAÇÃO (Correção Crítica de Duplicidade):
-- Integração da função deduplicate_transactions() do transaction_parser.py
-  para remover transações duplicadas antes do cálculo das métricas.
-- Log de quantas duplicatas foram removidas para auditoria.
+RODADA DEDUPLICAÇÃO (CORREÇÃO DE ARQUITETURA):
+- Removida chamada interna a deduplicate_transactions() que causava
+  dessincronização de índices com manual_exclusions/manual_inclusions.
+- A deduplicação permanece exclusivamente no app.py (ponto único de verdade).
 """
-
 import logging
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.transaction_parser import Transaction, deduplicate_transactions
+from src.transaction_parser import Transaction
 from src.rules_engine import evaluate_transaction
 
 logger = logging.getLogger(__name__)
@@ -68,6 +65,7 @@ CAT_INCLUIDA_MANUAL = "incluida_manual"
 CAT_EXCLUIDA_MANUAL = "excluida_manual"
 CAT_PENDENTE = "pendente"
 
+
 def is_month_complete(first_day: date, last_day: date) -> bool:
     """
     Verifica se o período entre a primeira e a última transação do mês
@@ -76,6 +74,7 @@ def is_month_complete(first_day: date, last_day: date) -> bool:
     if not first_day or not last_day:
         return False
     return (last_day - first_day).days + 1 > 20
+
 
 def _classify_transaction(
     idx: int,
@@ -152,13 +151,12 @@ def _classify_transaction(
         manual_exclusions=manual_exclusions,
         transaction_index=idx,
     )
-
     # Crédito automático desmarcado pelo operador chega aqui com o índice em
     # manual_exclusions — rastreia como exclusão manual.
     if manual_exclusions and idx in manual_exclusions:
         return is_excluded, reason, CAT_EXCLUIDA_MANUAL
-
     return is_excluded, reason, None
+
 
 def calculate_income_metrics(
     transactions: List[Transaction],
@@ -170,9 +168,15 @@ def calculate_income_metrics(
     Processa todas as transações, aplica regras de negócio + revisão manual
     e calcula as métricas de apuração de renda.
 
+    ⚠️  CONTRATO (SALVAGUARDA BUG 4):
+    A lista `transactions` DEVE vir já deduplicada e ordenada pelo app.py.
+    Esta função NUNCA deduplica internamente — os índices `idx` usados aqui
+    correspondem 1:1 aos índices da tabela de revisão do app.py, e são os
+    mesmos usados em manual_exclusions/manual_inclusions.
+
     Args:
-        transactions: Lista bruta (a posição na lista é o índice usado nas
-            estruturas de revisão manual).
+        transactions: Lista bruta JÁ DEDUPLICADA (a posição na lista é o
+            índice usado nas estruturas de revisão manual).
         holder_name: Nome do titular (habilita a regra de mesma titularidade
             por contraparte). Opcional.
         manual_exclusions: {índice: motivo} — exclusões do operador. Opcional.
@@ -185,10 +189,15 @@ def calculate_income_metrics(
         entradas_excluidas; e a nova chave revisao_manual:
         {"incluidas": [índices], "excluidas": [índices]} (FIX C).
     """
-    # RODADA DEDUPLICAÇÃO: remover transações duplicadas antes do processamento
-    unique_transactions, duplicates_removed = deduplicate_transactions(transactions)
-    
-    if not unique_transactions:
+    # =====================================================================
+    # ⚠️  SALVAGUARDA BUG 4: NÃO CHAMAR deduplicate_transactions() AQUI.
+    # A deduplicação é feita no app.py ANTES da revisão manual.
+    # Se chamarmos aqui, os índices de manual_exclusions/manual_inclusions
+    # deixam de corresponder às transações reais, causando decisões
+    # silenciosamente erradas do operador.
+    # =====================================================================
+
+    if not transactions:
         # Retorno rápido para lista vazia (evita processamento desnecessário)
         return {
             "total_geral": Decimal('0.00'),
@@ -202,7 +211,6 @@ def calculate_income_metrics(
 
     valid_transactions: List[Transaction] = []
     excluded_transactions: List[Dict[str, Any]] = []
-
     # FIX C (rodada 2): rastreabilidade da revisão manual.
     review_incluidas: List[int] = []
     review_excluidas: List[int] = []
@@ -212,12 +220,12 @@ def calculate_income_metrics(
     monthly_all_dates: Dict[Tuple[int, int], List[date]] = defaultdict(list)
 
     # 1. Classificação + Agrupamento em UMA ÚNICA PASSAGEM
-    # IMPORTANTE: usamos unique_transactions (já deduplicadas)
-    for idx, t in enumerate(unique_transactions):
+    # IMPORTANTE: iteramos sobre `transactions` (já deduplicada pelo app.py).
+    # O índice `idx` aqui é o MESMO índice da tabela de revisão do app.py.
+    for idx, t in enumerate(transactions):
         is_excluded, reason, review_category = _classify_transaction(
             idx, t, holder_name, manual_exclusions, manual_inclusions
         )
-
         if review_category == CAT_INCLUIDA_MANUAL:
             review_incluidas.append(idx)
         elif review_category in (CAT_EXCLUIDA_MANUAL, CAT_PENDENTE):
@@ -269,19 +277,16 @@ def calculate_income_metrics(
     # 3. Resumo mensal ordenado para interface/relatório
     monthly_summary: List[Dict[str, Any]] = []
     sorted_keys = sorted(monthly_valid_data.keys(), key=lambda x: (x[0], x[1]))
-
     for key in sorted_keys:
         year, month = key
         valid_txs = monthly_valid_data[key]
         total_valido = sum((t.amount for t in valid_txs), Decimal('0.00'))
-
         # CORREÇÃO: Calcular dias cobertos para este mês
         all_dates_for_month = monthly_all_dates[key]
         if all_dates_for_month:
             dias_cobertos = (max(all_dates_for_month) - min(all_dates_for_month)).days + 1
         else:
             dias_cobertos = 0
-
         monthly_summary.append({
             "month_label": f"{month:02d}/{year}",
             "dias_cobertos": dias_cobertos,

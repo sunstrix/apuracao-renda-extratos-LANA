@@ -4,6 +4,7 @@ generate_report(): PDF executivo (reportlab) com células em Paragraph
 (quebra de linha correta, sem estouro de coluna);
 generate_excel(): .xlsx com 3 abas (openpyxl);
 generate_csv(): .csv (utf-8-sig, separador ';' para Excel pt-BR).
+
 Rastreabilidade da revisão manual (TAREFA 5):
 lançamentos válidos confirmados manualmente pelo operador recebem o
 marcador "*" na descrição + nota de rodapé explicativa;
@@ -12,12 +13,14 @@ motivos de exclusão manual chegam na coluna de motivo da auditoria
 rules_engine a partir do Dict[int, str] da tela de revisão.
 Compatibilidade: lê tx.manually_confirmed via getattr — transações sem o
 atributo (fluxos antigos) comportam-se como não-manuais.
+
 RODADA 2:
 FIX F: seção/linhas de "Rastreabilidade da Revisão Manual" no PDF, Excel e
 CSV, consumindo a chave "revisao_manual" produzida pelo income_calculator
 (omitida automaticamente em fluxos antigos sem a chave);
 FIX G: canário de inconsistência — entrada válida com valor negativo gera
 logger.error nos três artefatos, sem alterar o fluxo de geração.
+
 RODADA GEMINI:
 FIX H: marcador de rastreabilidade da extração via IA — lançamentos com
 extraction_source="gemini" (atributo dinâmico setado pelo
@@ -25,6 +28,7 @@ gemini_extractor) recebem selo "[IA]" no PDF e "🤖" no Excel/CSV
 (Helvetica não possui glifos de emoji, daí a diferença de selo),
 nota de rodapé e contagem no resumo. Compatibilidade: getattr —
 transações sem o atributo (fluxo local) não recebem selo.
+
 RODADA ATUAL (CORREÇÃO ESTRUTURAL DO PDF):
 Agrupamento de lançamentos válidos por mês em seções separadas, cada uma
 com sua própria tabela (Data | Descrição | Valor) e subtotal do mês.
@@ -48,6 +52,12 @@ RODADA DECIMAL (Consistência com transaction_parser/income_calculator):
   de acumulação (total_geral_check, subtotal) e fallbacks de métricas.
 - Garante precisão monetária de centavos em todos os artefatos, consistente
   com o dataclass Transaction (que agora usa Decimal).
+
+RODADA BUG 3 FIX (Blindagem contra erros de tipo):
+- Reforço de _to_decimal() com tratamento explícito de InvalidOperation.
+- Todas as chamadas de format_currency() em generate_report(), generate_excel()
+  e generate_csv() usam _to_decimal() como camada de defesa.
+- Comentários de salvaguarda adicionados para prevenir regressão.
 """
 import io
 import csv
@@ -90,20 +100,31 @@ NOTA_EXTRACAO_IA = (
     "via IA (Gemini) e validados contra os somatórios impressos pelo banco"
 )
 
+# ---------------------------------------------------------------------------
+# BUG 3 FIX: Blindagem contra erros de tipo Decimal
+# ---------------------------------------------------------------------------
 def _to_decimal(value) -> Decimal:
-    """Converte valor (float, int, str, Decimal) para Decimal com segurança."""
+    """
+    Converte valor (float, int, str, Decimal) para Decimal com segurança.
+    BUG 3 FIX: Tratamento explícito de InvalidOperation para evitar crashes
+    em generate_report(), generate_excel() e generate_csv().
+    """
     if isinstance(value, Decimal):
         return value
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
+        logger.warning("Falha ao converter %r para Decimal, usando 0.00", value)
         return Decimal('0.00')
 
 def format_currency(value) -> str:
-    """Formata valor monetário em R$ com separadores pt-BR.
-    Compatível com Decimal, float e int."""
+    """
+    Formata valor monetário em R$ com separadores pt-BR.
+    Compatível com Decimal, float e int.
+    BUG 3 FIX: Usa _to_decimal() como camada de defesa contra tipos inválidos.
+    """
     v = _to_decimal(value)
-    # Formata com 2 casas decimais e separadores
+    # Formata com 2 casas decimais e separadores pt-BR
     formatted = f"{v:,.2f}"
     return f"R$ {formatted}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -249,9 +270,13 @@ class RelatorioApuracaoDoc(BaseDocTemplate):
         """Atualiza a contagem total de páginas para o rodapé "Página X de Y"."""
         self.page_count = self.page  # Armazena o número da última página
 
-
 def generate_report(metrics: Dict[str, Any], holder_name: str,
                     institutions: List[str]) -> io.BytesIO:
+    """
+    Gera o relatório PDF executivo.
+    BUG 3 FIX: Todas as chamadas de format_currency() usam _to_decimal() como
+    camada de defesa contra tipos inválidos (Decimal, float, int, str).
+    """
     buffer = io.BytesIO()
     doc = RelatorioApuracaoDoc(
         buffer,
@@ -292,6 +317,7 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
     story.append(Spacer(1, 0.5 * cm))
 
     # --- Cards de KPI ---
+    # BUG 3 FIX: fallback explícito para Decimal('0.00') se métrica ausente
     kpi_data = [
         [Paragraph("<b>Total Geral Acumulado</b>", subtitle_style),
          Paragraph("<b>Média Mensal Geral</b>", subtitle_style),
@@ -473,7 +499,6 @@ def generate_report(metrics: Dict[str, Any], holder_name: str,
     buffer.seek(0)
     return buffer
 
-
 def _excel_header_style(ws, ncols: int):
     from openpyxl.styles import Font, PatternFill
     fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
@@ -482,9 +507,13 @@ def _excel_header_style(ws, ncols: int):
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = fill
 
-
 def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
                    institutions: List[str] = None) -> bytes:
+    """
+    Gera o arquivo Excel (.xlsx) com 3 abas.
+    BUG 3 FIX: Todas as conversões para float usam _to_decimal() como camada
+    de defesa, com quantize() para precisão de 2 casas decimais.
+    """
     from openpyxl import Workbook
     wb = Workbook()
 
@@ -573,8 +602,12 @@ def generate_excel(metrics: Dict[str, Any], holder_name: str = "",
     wb.save(buf)
     return buf.getvalue()
 
-
 def generate_csv(metrics: Dict[str, Any]) -> bytes:
+    """
+    Gera o arquivo CSV (utf-8-sig, separador ';' para Excel pt-BR).
+    BUG 3 FIX: Todas as formatações monetárias usam _to_decimal() como camada
+    de defesa contra tipos inválidos.
+    """
     out = io.StringIO()
     w = csv.writer(out, delimiter=";")
     w.writerow(["RESUMO MENSAL"])

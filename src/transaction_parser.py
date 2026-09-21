@@ -8,10 +8,11 @@ look-ahead de valor inline (FIX H/J) e ALINHAMENTO POSICIONAL POR
 PÁGINA com o bloco "VALORES EM R$" (FIX N, rodada 5);
 parse_itau/bradesco/santander/caixa/bb/picpay: variações do layout dd/mm;
 parse_generic(): fallback universal.
-RODADA 6 (Correção Crítica de Normalização e Titular):
-- Substituído line.lower() por _normalize_text() em todos os filtros.
-- Corrigido índice de look-behind e normalização de cabeçalhos colados.
-- Adicionada extração do nome do titular (extract_santander_holder).
+RODADA 6 - CORREÇÃO CRÍTICA SANTANDER:
+- Função _uncollapse_santander_line() descolapsa tabelas do OCR
+- Macro-estados (CC/RF/IE) previnem vazamento de Renda Fixa e Índices
+- Memória de current_date para transações do mesmo dia
+- Regex robusto para extração do titular
 """
 import re
 import logging
@@ -632,8 +633,8 @@ def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[T
     context_year: Optional[int] = None
     i, n = 0, len(lines)
     date_extenso_re = re.compile(r'(\d{1,2})\s+de\s+([A-Za-zçãáéíóú]+)\s+de\s+(\d{4})')
-    balance_line_re = re.compile(r'Saldo do dia:\s*R\$')
-    money_re = re.compile(r'(-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})')
+    balance_line_re = re.compile(r'Saldo do dia:\sR$')
+    money_re = re.compile(r'(-?R\$\s\d{1,3}(?:\.\d{3})*,\d{2})')
     meses_pt = {
         'janeiro': 1, 'fevereiro': 2, 'março': 3, 'marco': 3,
         'abril': 4, 'maio': 5, 'junho': 6, 'julho': 7,
@@ -725,7 +726,6 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
             money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
             if not money_matches:
                 continue
-            
             amount_str = money_matches[0] 
             amount = parse_money_value(amount_str)
             is_credit = None
@@ -760,23 +760,59 @@ def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> 
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
 # ---------------------------------------------------------------------------
-# Parser Santander (específico) - RODADA 6: CORREÇÃO DE NORMALIZAÇÃO E TITULAR
+# Parser Santander (específico) - RODADA 6: CORREÇÃO CRÍTICA
 # ---------------------------------------------------------------------------
+def _uncollapse_santander_line(line: str) -> List[str]:
+    """
+    Desfaz a colapsação bizarra do OCR (tabelas inteiras em 1 linha).
+    Usa âncoras financeiras e datas para injetar quebras de linha onde deveriam existir.
+    """
+    if not line:
+        return []
+        
+    # Se a linha for normal/curta e não tiver tag, não perde tempo
+    if "<table>" not in line.lower() and len(line) < 150:
+        return [line]
+
+    text = re.sub(r'</?table>', '', line, flags=re.IGNORECASE)
+    text = text.replace('<br/>', ' ')
+    # Remove cabeçalho colapsado se existir
+    text = re.sub(r'Data\s+Descrição\s+Nº Documento\s+Movimento \(R\$\)\s+Saldo \(R\$\)', ' ', text, flags=re.IGNORECASE)
+
+    # 1. Desgrudar dinheiro de data seguinte: "10,8103/11" -> "10,81 \n 03/11"
+    text = re.sub(r'(,\d{2}-?)(\d{2}/\d{2})', r'\1\n\2 ', text)
+
+    # 2. Desgrudar dinheiro de descrições: "300,78PIX RECEBIDO" -> "300,78 \n PIX RECEBIDO"
+    starters = r'(PIX RECEBIDO|PIX ENVIADO|PAGAMENTO|DEBITO|APLICACAO|RESGATE|SALDO EM|ADM CARTAO)'
+    text = re.sub(r'(,\d{2}-?)' + starters, r'\1\n\2', text, flags=re.IGNORECASE)
+
+    # 3. Desgrudar Letra de descrições (ex: "SILVEIPAGAMENTO" -> "SILVEI \n PAGAMENTO")
+    text = re.sub(r'([a-zA-Z])' + starters, r'\1\n\2', text)
+
+    # 4. Adicionar espaço se a Data estiver colada num texto: "03/11PIX" -> "03/11 PIX"
+    text = re.sub(r'(\d{2}/\d{2})(?=[^\s\d])', r'\1 ', text)
+
+    # 5. Adicionar espaço se Nome estiver colado em dinheiro negativo: "costa-200,00" -> "costa -200,00"
+    text = re.sub(r'([a-zA-Z])([-+]\d{1,3})', r'\1 \2', text)
+
+    # 6. Desgrudar dois dinheiros colados: "-200,00210,81" -> "-200,00 210,81"
+    text = re.sub(r'(,\d{2}-?)(?=[-+]?\d)', r'\1 ', text)
+
+    return [ln.strip() for ln in text.split('\n') if ln.strip()]
+
 def extract_santander_holder(text: str) -> Optional[str]:
     """
-    Extrai o nome do titular do extrato Santander.
-    Procura por padrões como "Nome JULIELLEN LEMOS DA SILVEIRA" ou "Prezada Juliellen".
+    Extrai o nome do titular do extrato Santander de forma robusta contra quebras de linha do OCR.
     """
-    # Tenta encontrar "Nome <NOME COMPLETO>"
-    m = re.search(r'\bNome\s+([A-ZÀ-Ü][A-ZÀ-Ü\s]{5,80}?)(?:\n|Agência|Conta|$)', text, re.IGNORECASE)
+    # Procura por "Nome <Pula linhas> NOME DA PESSOA <Pula Linhas> Agência"
+    m = re.search(r'\bNome\s+([A-ZÀ-Ü][A-ZÀ-Ü\s]{5,80}?)\s+(?:Agência|Agencia|Conta|Movimentação)', text, re.IGNORECASE)
     if m:
         name = re.sub(r'\s+', ' ', m.group(1)).strip()
-        # Remove possíveis ruídos de OCR no final (ex: números de agência)
-        name = re.sub(r'\s+\d{2,}', '', name)
+        name = re.sub(r'\s+\d{2,}', '', name)  # Remove lixo numérico
         return name
         
     # Fallback: "Prezada <Nome>"
-    m2 = re.search(r'Prezada\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+){1,4})', text, re.IGNORECASE)
+    m2 = re.search(r'Prezad[ao]\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+){1,4})', text, re.IGNORECASE)
     if m2:
         return m2.group(1).strip()
         
@@ -784,186 +820,189 @@ def extract_santander_holder(text: str) -> Optional[str]:
 
 def _parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
     """
-    Parser robusto para extratos Santander.
-    Estratégia:
-    1. Máquina de estados para identificar seções
-    2. Processa APENAS a seção "Movimentação" da Conta Corrente
-    3. Ignora CDB/RDB, Índices Econômicos, Saldos por Período, etc.
-    4. Validação semântica rigorosa com normalização de acentos.
+    Parser robusto para extratos Santander com máquina de Macro-Estados (Conta Corrente vs Renda Fixa) 
+    e descolapsamento agressivo de strings do OCR.
     """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     
     context_year: Optional[int] = None
-    for line in lines[:20]:
-        year_match = re.search(r'\b(202[0-9]|203[0-5])\b', line)
-        if year_match:
-            context_year = int(year_match.group(1))
+    for line in lines[:30]:
+        # Busca contexto priorizando o bloco "Resumo - mês/ano"
+        m = re.search(r'resumo\s*-?\s*\w+\s*/\s*(\d{4})', line, re.IGNORECASE)
+        if m:
+            context_year = int(m.group(1))
             break
+    
+    if context_year is None:
+        for line in lines[:30]:
+            year_match = re.search(r'\b(202[0-9]|203[0-5])\b', line)
+            if year_match:
+                context_year = int(year_match.group(1))
+                break
     if context_year is None:
         context_year = date.today().year
         
-    # Keywords que indicam seções para IGNORAR (Anti-lixo)
-    ignore_keywords = (
+    # Keywords
+    ignore_keywords_norm = tuple(_normalize_text(k) for k in (
         "renda fixa", "cdb", "rdb", "minhas reservas", "aplicacao n", "aplicação n",
-        "indices economicos", "índices econômicos", "saldos por periodo", "saldos por período",
-        "compras com cartao", "compras com cartão", "comprovantes de pagamento", 
-        "pacote de servicos", "pacote de serviços", "fale conosco", "ouvidoria",
-        "valor inicial", "saldo anterior", "saldo atual", "valor liquido", "valor líquido",
-        "rendimento bruto", "valor ir/iof", "pagamento de juros", "% indexador", 
-        "data de vencimento", "dolar", "euro", "salario minimo", "cdi", "ipca", 
-        "inpc", "igpm", "incc", "tr", "poupanca", "ibovespa", "dólar", "salário mínimo", 
-        "selic", "referencia", "fechamento", "valores referencia"
-    )
+        "compras com cartao", "valor inicial", "saldo anterior", "saldo atual", "valor liquido",
+        "rendimento bruto", "valor ir/iof", "pagamento de juros", "% indexador", "data de vencimento",
+        "dolar", "euro", "salario minimo", "cdi", "ipca", "inpc", "igpm", "incc", "tr", "poupanca",
+        "ibovespa", "selic", "referencia", "fechamento", "valores referencia"
+    ))
     
-    # Pré-computar keywords normalizadas para performance e casamento exato
-    ignore_keywords_norm = tuple(_normalize_text(k) for k in ignore_keywords)
     exit_keywords_norm = tuple(_normalize_text(k) for k in [
-        "saldos por periodo", "saldos por período",
-        "compras com cartao de debito", "compras com cartão de débito",
-        "comprovantes de pagamento",
-        "renda fixa", "cdb / rdb", "minhas reservas",
-        "indices economicos", "índices econômicos", "indices financeiros",
-        "pacote de servicos", "pacote de serviços",
-        "fale conosco", "ouvidoria"
+        "saldos por periodo", "compras com cartao de debito", "comprovantes de pagamento",
+        "renda fixa", "pacote de servicos", "fale conosco", "ouvidoria", "indices economicos"
     ])
     
+    macro_section = None
     in_movimentacao = False
+    current_date = None  # Memória de data para transações do mesmo dia
+    
     i = 0
     while i < len(lines):
-        line = lines[i]
+        raw_line = lines[i]
         i += 1
-        if not line:
+        if not raw_line:
             continue
             
-        # Normalizar a linha para comparação (remove acentos e lower)
-        low = _normalize_text(line)
+        low = _normalize_text(raw_line)
+        low_ns = low.replace(" ", "")
         
         # ===================================================================
-        # DETECÇÃO DE ENTRADA NA SEÇÃO MOVIMENTAÇÃO
+        # 1. RASTREAMENTO DE MACRO-SEÇÕES
         # ===================================================================
-        if not in_movimentacao:
-            if "movimentacao" in low or "movimentação" in low:
-                # Look-ahead: próximas 3 linhas
-                lookahead = " ".join(lines[i:i+3])
-                lookahead_norm = _normalize_text(lookahead).replace(" ", "")
-                has_header = (
-                    "data" in lookahead_norm and
-                    ("descricao" in lookahead_norm or "lancamento" in lookahead_norm) and
-                    ("movimento" in lookahead_norm or "valor" in lookahead_norm) and
-                    "saldo" in lookahead_norm
-                )
-                # Look-behind: até 4 linhas anteriores (excluindo a atual)
-                prev_lines = " ".join(lines[max(0, i-4):i-1])
-                prev_norm = _normalize_text(prev_lines)
-                prev_is_conta_corrente = "contacorrente" in prev_norm
+        if "contacorrente" in low_ns:
+            macro_section = "CC"
+        elif "rendafixa" in low_ns or "cdb/rdb" in low_ns:
+            macro_section = "RF"
+        elif "indiceseconomicos" in low_ns:
+            macro_section = "IE"
+            
+        # ENTRADA
+        if macro_section == "CC" and not in_movimentacao:
+            if "movimentacao" in low:
+                in_movimentacao = True
+                logger.info("Santander: ENTRADA na seção Movimentação (linha: %s)", raw_line[:80])
+                continue
                 
-                if has_header or prev_is_conta_corrente:
-                    in_movimentacao = True
-                    logger.info("Santander: ENTRADA na seção Movimentação (linha: %s)", line[:80])
-                    continue
-                    
-        # ===================================================================
-        # DETECÇÃO DE SAÍDA DA SEÇÃO MOVIMENTAÇÃO
-        # ===================================================================
+        # SAÍDA
         if in_movimentacao:
-            if any(kw in low for kw in exit_keywords_norm):
+            if macro_section != "CC" or any(kw in low for kw in exit_keywords_norm):
                 in_movimentacao = False
-                logger.info("Santander: SAÍDA da seção Movimentação (linha: %s)", line[:80])
+                logger.info("Santander: SAÍDA da seção Movimentação (Macro=%s / linha: %s)", macro_section, raw_line[:80])
                 continue
                 
-        # ===================================================================
-        # PROCESSAMENTO: Só processa se estiver na seção Movimentação
-        # ===================================================================
+        # Se não estiver na movimentação correta, pula a linha
         if not in_movimentacao:
             continue
             
-        # 1. Filtro anti-lixo (usando versão normalizada)
-        if any(kw in low for kw in ignore_keywords_norm):
-            continue
-            
-        # 2. Pular cabeçalhos óbvios
-        if low.startswith(('data', 'lancamento', 'valor', 'saldo', 'periodo', 'historico', 'nº documento', 'numero documento')):
-            continue
-        if 'saldo' in low and ('inicial' in low or 'final' in low):
-            continue
-            
-        # 3. Normalização leve de OCR para a data (O -> 0, l -> 1)
-        norm_line = re.sub(r'(?<=\d)O(?=\d)', '0', line)
-        norm_line = re.sub(r'(?<=\d)l(?=\d)', '1', norm_line)
+        # ===================================================================
+        # 2. DESCOLAPSAMENTO DO TEXTO DO OCR
+        # ===================================================================
+        processed_lines = _uncollapse_santander_line(raw_line)
         
-        # 4. Buscar data
-        date_match = re.search(r'(\d{2}/\d{2}/\d{4})', norm_line)
-        if not date_match:
-            short_match = re.search(r'(\d{2}/\d{2})\b', norm_line)
-            if short_match and context_year:
-                date_str = short_match.group(1)
-                try:
-                    parsed_date = date_parser.parse(f"{date_str}/{context_year}", dayfirst=True).date()
-                except ValueError:
-                    continue
-            else:
-                continue
-        else:
-            date_str = date_match.group(1)
-            try:
-                parsed_date = date_parser.parse(date_str, dayfirst=True).date()
-            except ValueError:
+        for line in processed_lines:
+            low_p = _normalize_text(line)
+            
+            # Filtro anti-lixo na linha destrinchada
+            if any(kw in low_p for kw in ignore_keywords_norm):
                 continue
                 
-        # 5. Filtro de datas futuras
-        if parsed_date.year >= 2027:
-            continue
+            if low_p.startswith(('data', 'lancamento', 'valor', 'saldo', 'periodo')):
+                continue
+            if 'saldo' in low_p and ('inicial' in low_p or 'final' in low_p or 'em ' in low_p):
+                continue
+                
+            norm_line = re.sub(r'(?<=\d)O(?=\d)', '0', line)
+            norm_line = re.sub(r'(?<=\d)l(?=\d)', '1', norm_line)
             
-        # 6. Buscar valores monetários
-        money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', norm_line)
-        if not money_matches:
-            continue
+            # ===================================================================
+            # 3. EXTRAÇÃO DE DATA (com memória)
+            # ===================================================================
+            parsed_date = None
+            date_str = ""
             
-        amount_str = money_matches[0]
-        amount = parse_money_value(amount_str)
-        
-        # 7. Determinar crédito/débito
-        is_credit = None
-        if amount_str.startswith('+'):
-            is_credit = True
-            amount = abs(amount)
-        elif amount_str.startswith('-'):
-            is_credit = False
-            amount = -abs(amount)
-        else:
-            if any(w in low for w in ("credito", "recebido", "entrada", "deposito", "salario")):
+            date_match = re.search(r'(\d{2}/\d{2}/\d{4})', norm_line)
+            if date_match:
+                date_str = date_match.group(1)
+                try:
+                    parsed_date = date_parser.parse(date_str, dayfirst=True).date()
+                except ValueError:
+                    pass
+            else:
+                short_match = re.search(r'(\d{2}/\d{2})\b', norm_line)
+                if short_match and context_year:
+                    date_str = short_match.group(1)
+                    try:
+                        parsed_date = date_parser.parse(f"{date_str}/{context_year}", dayfirst=True).date()
+                    except ValueError:
+                        pass
+
+            if parsed_date and parsed_date.year < 2027:
+                current_date = parsed_date
+            elif current_date:
+                # Usa a data da transação anterior (comum quando o OCR pula o dia)
+                parsed_date = current_date
+            else:
+                continue  # Sem data e sem histórico, não há como registrar
+                
+            # ===================================================================
+            # 4. EXTRAÇÃO FINANCEIRA E SINAL
+            # ===================================================================
+            # Regex lida com valores negativos no final da string "169,08-"
+            money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2}-?)', norm_line)
+            if not money_matches:
+                continue
+                
+            # A prioridade é sempre o PRIMEIRO valor financeiro (que é o Movimento. O segundo é o Saldo).
+            amount_str = money_matches[0]
+            amount = parse_money_value(amount_str)  # Já lida corretamente com sinais no final da string
+            
+            is_credit = None
+            if amount_str.startswith('+'):
                 is_credit = True
                 amount = abs(amount)
-            elif any(w in low for w in ("debito", "enviado", "saida", "pagamento")):
+            elif amount_str.startswith('-') or amount_str.endswith('-'):
                 is_credit = False
                 amount = -abs(amount)
             else:
-                is_credit = amount >= 0
+                if any(w in low_p for w in ("credito", "recebido", "entrada", "deposito", "salario")):
+                    is_credit = True
+                    amount = abs(amount)
+                elif any(w in low_p for w in ("debito", "enviado", "saida", "pagamento", "resgate")):
+                    is_credit = False
+                    amount = -abs(amount)
+                else:
+                    is_credit = amount >= 0
+                    
+            # ===================================================================
+            # 5. EXTRAÇÃO DE DESCRIÇÃO
+            # ===================================================================
+            desc = norm_line
+            if date_str:
+                desc = desc.replace(date_str, "", 1)
+            for m in money_matches:
+                desc = desc.replace(m, "", 1)
                 
-        # 8. Extrair descrição
-        date_idx = norm_line.find(date_str)
-        amount_idx = norm_line.find(amount_str)
-        if date_idx >= 0 and amount_idx >= 0 and amount_idx > date_idx:
-            description = norm_line[date_idx + len(date_str):amount_idx].strip()
-            description = re.sub(r'\b\d{3,}\b', '', description)
-        else:
-            description = norm_line.replace(date_str, "", 1).replace(amount_str, "", 1).strip()
+            description = re.sub(r'\b\d{3,}\b', '', desc)  # Remove lixo numérico longo
+            description = re.sub(r'\s+', ' ', description).strip(" -–|*")
             
-        description = re.sub(r'\s+', ' ', description).strip(" -–|*")
-        if not description or len(description) < 3:
-            description = "Lançamento não identificado"
+            if not description or len(description) < 3:
+                description = "Lançamento não identificado"
+                
+            transactions.append(Transaction(
+                date=parsed_date,
+                description=description,
+                amount=amount,
+                is_credit=is_credit,
+                bank=bank,
+                source_file=source_file,
+                needs_review=(is_credit is None),
+            ))
             
-        transactions.append(Transaction(
-            date=parsed_date,
-            description=description,
-            amount=amount,
-            is_credit=is_credit,
-            bank=bank,
-            source_file=source_file,
-            needs_review=(is_credit is None),
-        ))
-        
     logger.info("Santander: %d transações extraídas de %s", len(transactions), source_file or "PDF")
     return transactions
 

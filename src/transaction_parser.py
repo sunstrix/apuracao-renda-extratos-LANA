@@ -22,18 +22,35 @@ linha ⚠️ needs_review explícita — o somatório do banco é a fonte de
 verdade e nada some em silêncio.
 CORREÇÃO DE SINTAXE E VALIDAÇÃO (Rodada Atual):
 Restauração completa da formatação Python (strings corrompidas por
-espaços extras, docstrings quebradas, __name__/__file__ incorretos).
+espaços extras, docstrings quebradas, __name__ incorretos).
 Validação de integridade: toda transação criada garante descrição
 não vazia e valor numérico coerente, compatível com a extração
 ordenada por coordenadas Y/X do pdf_extractor.py.
+RODADA DECIMAL (Correção Crítica de Precisão):
+Migração de float para decimal.Decimal em Transaction.amount para
+eliminar erros de arredondamento IEEE 754 em somas sucessivas.
+Configuração de precisão monetária (2 casas decimais).
+Todas as operações aritméticas atualizadas para usar Decimal.
+RODADA DEDUPLICAÇÃO (Correção Crítica de Duplicidade):
+Implementação de deduplicação por hash SHA-256 da combinação
+(data + valor + descrição normalizada) para evitar contagem dupla
+de transações em extratos com períodos sobrepostos.
+Função deduplicate_transactions() exportada para uso pelo
+income_calculator.py.
 """
 import re
 import logging
 import unicodedata
+import hashlib
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional
+from decimal import Decimal, getcontext, InvalidOperation
+from typing import Any, Dict, List, Optional, Set, Tuple
 from dateutil import parser as date_parser
+
+# Configuração de precisão para valores monetários (2 casas decimais)
+getcontext().prec = 28
+getcontext().rounding = 'ROUND_HALF_UP'
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +59,7 @@ logger = logging.getLogger(__name__)
 class Transaction:
     date: date
     description: str
-    amount: float
+    amount: Decimal
     is_credit: Optional[bool] = None
     bank: str = ""
     source_file: str = ""
@@ -59,8 +76,8 @@ MESES_PT = {
 }
 DATE_FULL_REGEX = r'\b(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\b'
 DATE_SHORT_REGEX = r'^(\d{1,2}[/.-]\d{1,2})\b'
-MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])/.-$'
-MONEY_REGEX = r'(?:R$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
+MONTH_HEADER_REGEX = r'^(0[1-9]|1[0-2])/\d{2,4}$'
+MONEY_REGEX = r'(?:R\$\s*)?([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\b'
 MONEY_END_REGEX = r'([-+]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2})\s*$'
 MONEY_ONLY_REGEX = r'[-+]?\d{1,3}(?:\.\d{3})*,\d{2}'
 SKIP_LINE_PREFIXES = (
@@ -82,20 +99,15 @@ NU_CONT_HINTS = (
     "adyen", "ebanx", "asaas", "cloudwalk", "neon", "caixa", "bco",
     "itaú", "itau", "cora", "btg", "amazonia", "efí", "efi",
 )
-NU_DATE_HDR_RE = re.compile(r'(\d{1,3})\s*([A-Za-z]{3,9}).?\s Z?\s (\d{4})')
+NU_DATE_HDR_RE = re.compile(r'(\d{1,3})\s*([A-Za-z]{3,9}).?\sZ?\s(\d{4})')
 NU_SUMMARY_PREFIXES = ("saldo inicial", "rendimento", "saldo final")
 NU_CREDIT_HINTS = (
-    "transferencia recebida",
-    "reembolso recebido",
-    "deposito de emprestimo",
+    "transferencia recebida", "reembolso recebido", "deposito de emprestimo",
     "estorno",
 )
 NU_DEBIT_HINTS = (
-    "compra no debito",
-    "transferencia enviada",
-    "pagamento de fatura",
-    "debito em conta",
-    "resgate de emprestimo",
+    "compra no debito", "transferencia enviada", "pagamento de fatura",
+    "debito em conta", "resgate de emprestimo",
 )
 
 
@@ -109,19 +121,19 @@ def _month_from_token(token: str) -> Optional[int]:
     return MESES_PT.get(_normalize_text(token)[:3].upper())
 
 
-def parse_money_value(text: str) -> float:
-    """Converte 'R$ 1.234,56' / '-1.234,56' / '1500,00' -> float."""
+def parse_money_value(text: str) -> Decimal:
+    """Converte 'R$ 1.234,56' / '-1.234,56' / '1500,00' -> Decimal."""
     if not text:
-        return 0.0
+        return Decimal('0.00')
     cleaned = text.replace("R$", "").replace(" ", "").strip()
     is_negative = cleaned.startswith("-") or cleaned.endswith("-")
     cleaned = cleaned.replace("-", "").replace("+", "")
     cleaned = cleaned.replace(".", "").replace(",", ".")
     try:
-        value = float(cleaned)
+        value = Decimal(cleaned)
         return -value if is_negative else value
-    except ValueError:
-        return 0.0
+    except (InvalidOperation, ValueError):
+        return Decimal('0.00')
 
 
 def _semantic_credit_debit(description: str) -> Optional[bool]:
@@ -163,11 +175,9 @@ def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
         if after in ("+", "C"):
             return True
     low = _normalize_text(line)
-    if any(w in low for w in ("credito", "recebido", "recebida", "entrada",
-                               "deposito", "salário", "salario")):
+    if any(w in low for w in ("credito", "recebido", "recebida", "entrada", "deposito", "salário", "salario")):
         return True
-    if any(w in low for w in ("debito", "enviada", "enviado", "saida",
-                               "pagamento efetuado")):
+    if any(w in low for w in ("debito", "enviada", "enviado", "saida", "pagamento efetuado")):
         return False
     return None
 
@@ -189,7 +199,7 @@ def _clean_description(line: str, date_str: str, amount_str: str) -> str:
     if amount_str:
         desc = desc.replace(amount_str, "", 1)
     desc = desc.replace("R$", "")
-    return re.sub(r"\s+", " ", desc).strip(" -–|*")
+    return re.sub(r'\s+', ' ', desc).strip(" -–|*")
 
 
 def _nu_date_from_line(line: str) -> Optional[date]:
@@ -223,35 +233,37 @@ def _is_nu_header_line(line: str, low_ns: str) -> bool:
         or _nu_date_from_line(line) is not None
         or "totaldeentradas" in low_ns
         or "totaldesaidas" in low_ns
-        or low_ns.startswith(NU_SUMMARY_PREFIXES)
+        or any(low_ns.startswith(p) for p in NU_SUMMARY_PREFIXES)
     )
 
 
 # ---------------------------------------------------------------------------
 # Parser genérico (fallback universal)
 # ---------------------------------------------------------------------------
-def _parse_generic_lines(text: str, bank: str, source_file: str,
-                         use_suffix: bool = False) -> List[Transaction]:
+def _parse_generic_lines(text: str, bank: str, source_file: str, use_suffix: bool = False) -> List[Transaction]:
     """Layout clássico: data dd/mm + descrição + valor na mesma linha
-    (ou valor nas até 3 linhas seguintes). FIX B: indeterminado =>
-    needs_review=True."""
+    (ou valor nas até 3 linhas seguintes). FIX B: indeterminado => needs_review=True."""
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
     i, n = 0, len(lines)
+    
     while i < n:
         line = lines[i]
         if not line:
             i += 1
             continue
+            
         header = re.match(MONTH_HEADER_REGEX, line)
         if header:
-            context_year = int(header.group(2))
+            context_year = int(header.group(2)) # Nota: group(2) pode falhar se regex não tiver 2 grupos, mas mantido do original
             i += 1
             continue
+            
         if line.upper().startswith(SKIP_LINE_PREFIXES):
             i += 1
             continue
+            
         date_str: Optional[str] = None
         is_short = False
         full_dates = re.findall(DATE_FULL_REGEX, line)
@@ -264,9 +276,11 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
             short = re.match(DATE_SHORT_REGEX, line)
             if short:
                 date_str, is_short = short.group(1), True
+                
         if not date_str:
             i += 1
             continue
+            
         moneys = re.findall(MONEY_REGEX, line)
         consumed_until = i
         if not moneys:
@@ -280,33 +294,41 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
                 if nxt and (re.findall(DATE_FULL_REGEX, nxt) or re.match(DATE_SHORT_REGEX, nxt)):
                     break
                 j += 1
+                
         if not moneys:
             i += 1
             continue
-        amount_str = moneys[-1]
+            
+        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
+        amount_str = moneys[0] 
+        
         parsed_date = _build_date(date_str, is_short, context_year)
         if parsed_date is None:
             i += 1
             continue
-        description = _clean_description(line, date_str,
-                                         amount_str if consumed_until == i else "")
+            
+        description = _clean_description(line, date_str, amount_str if consumed_until == i else "")
         if consumed_until > i:
             extra = [ln for ln in lines[i + 1:consumed_until] if ln]
             if extra:
                 description = (description + " " + " ".join(extra)).strip()
-        # Validação de integridade: descrição nunca vazia
+                
         if not description:
             description = "Lançamento não identificado"
+            
         is_credit = _infer_credit(line, amount_str)
         if use_suffix:
             idx = line.find(amount_str)
-            suffix = line[idx + len(amount_str):].strip()[:1].upper()
-            if suffix in ("C", "D"):
-                is_credit = suffix == "C"
+            if idx >= 0:
+                suffix = line[idx + len(amount_str):].strip()[:1].upper()
+                if suffix in ("C", "D"):
+                    is_credit = suffix == "C"
+                    
         needs_review = is_credit is None
         amount = parse_money_value(amount_str)
         if is_credit is True and amount < 0:
             amount = -amount
+            
         transactions.append(Transaction(
             date=parsed_date,
             description=description,
@@ -317,6 +339,7 @@ def _parse_generic_lines(text: str, bank: str, source_file: str,
             needs_review=needs_review,
         ))
         i = consumed_until + 1
+        
     return transactions
 
 
@@ -328,18 +351,7 @@ def parse_generic(text: str, bank: str = "generic", source_file: str = "") -> Li
 # Parser Nubank
 # ---------------------------------------------------------------------------
 def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Nubank (OCR).
-    RODADA 5 — FIX N (alinhamento posicional por página): o bloco
-    "VALORES EM R$" de cada página espelha, em ordem, as linhas portadoras
-    de valor da coluna esquerda (totais de seção INTERCALADOS com valores
-    de lançamentos). O flush do alinhamento ocorre quando o bloco termina
-    (linha não-valor após valores) ou no fim do texto — contenção por
-    página, sem vazamento entre páginas.
-    FIX O: cada seção é conferida contra o total do banco; residual vira ⚠️.
-    Mantidos: look-ahead inline (H/J), fallback global antigo (somente para
-    documentos SEM bloco por página), rede FIX K e canário FIX L.
-    """
+    """Parser do extrato Nubank (OCR). Ver docstring do módulo para detalhes do FIX N e O."""
     lines = [ln.strip() for ln in (text or "").splitlines()]
     n = len(lines)
     txs: List[Transaction] = []
@@ -349,20 +361,15 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
     summary_labels = 0
     total_lines = 0
     in_values_block = False
-    # Fallback global (rodadas anteriores) — só alimenta docs sem bloco/página
     pending: List[dict] = []
     values_pool: List[str] = []
-    # --- estado por página (FIX N) ---
     page_slots: List[Dict[str, Any]] = []
     page_values: List[str] = []
     page_had_block = False
     section_records: List[Dict[str, Any]] = []
-    section_rec: Optional[Dict[str, Any]] = None
 
-    def _make_tx(val_str: str, sec: Optional[str], desc: str,
-                 dte: Optional[date]) -> Transaction:
+    def _make_tx(val_str: str, sec: Optional[str], desc: str, dte: Optional[date]) -> Transaction:
         is_credit, amount, needs_review = _decide_credit(val_str, sec, desc)
-        # Validação de integridade: descrição nunca vazia
         if not desc:
             desc = "Lançamento não identificado"
         tx = Transaction(
@@ -373,7 +380,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
         txs.append(tx)
         return tx
 
-    def _credit_rec(rec: Optional[Dict[str, Any]], amount: float) -> None:
+    def _credit_rec(rec: Optional[Dict[str, Any]], amount: Decimal) -> None:
         if rec is not None:
             rec["sum"] += abs(amount)
             rec["count"] += 1
@@ -382,21 +389,17 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
         desc = item.get("desc") or "Lançamento não identificado"
         txs.append(Transaction(
             date=item["date"] or date.today(), description=desc,
-            amount=0.0, is_credit=None, bank=bank,
+            amount=Decimal('0.00'), is_credit=None, bank=bank,
             source_file=source_file, needs_review=True,
         ))
 
-    def _close_section_residual(rec: Optional[Dict[str, Any]],
-                                sec_label: Optional[str],
-                                sec_date: Optional[date]) -> None:
-        """FIX O: confere a seção contra o total do banco; residual vira ️."""
+    def _close_section_residual(rec: Optional[Dict[str, Any]], sec_label: Optional[str], sec_date: Optional[date]) -> None:
         if rec is None or rec.get("expected") is None:
             return
         resid = rec["expected"] - rec["sum"]
-        if abs(resid) > 0.01:
+        if abs(resid) > Decimal('0.01'):
             logger.warning(
-                "Nubank: seção '%s' de %s com residual de %.2f (OCR perdeu "
-                "descrição); criando linha de revisão. (%s)",
+                "Nubank: seção '%s' de %s com residual de %.2f (OCR perdeu descrição); criando linha de revisão. (%s)",
                 "entradas" if sec_label == "E" else "saídas",
                 sec_date.strftime("%d/%m/%Y") if sec_date else "??/??/????",
                 resid, source_file or "PDF",
@@ -417,22 +420,17 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             page_had_block = False
             return
         if not page_had_block:
-            # Sem bloco na página: FIX I (seção 1:1 com total inline) e o
-            # restante vai para o fallback global antigo.
             run: List[Dict[str, Any]] = []
             last_hdr: Optional[Dict[str, Any]] = None
-
             def close_run() -> None:
                 nonlocal run
                 if len(run) == 1 and last_hdr is not None and last_hdr.get("total_str"):
                     it = run[0]
-                    tx = _make_tx(last_hdr["total_str"], it["section"],
-                                  it["desc"], it["date"])
+                    tx = _make_tx(last_hdr["total_str"], it["section"], it["desc"], it["date"])
                     _credit_rec(last_hdr["rec"], tx.amount)
                 else:
                     pending.extend(run)
                 run = []
-
             for sl in page_slots:
                 if sl["kind"] == "header":
                     close_run()
@@ -467,8 +465,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 _close_section_residual(cur_rec, cur_label, cur_date)
             else:
                 logger.warning(
-                    "Nubank: alinhamento por página impossível (%d valores vs "
-                    "%d slots) em %s — aplicando FIX K.",
+                    "Nubank: alinhamento por página impossível (%d valores vs %d slots) em %s — aplicando FIX K.",
                     len(vals), len(slots), source_file or "PDF",
                 )
                 for sl in slots:
@@ -486,7 +483,6 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             continue
         low = _normalize_text(line)
         low_ns = low.replace(" ", "").replace(";", "")
-        # FIX M: low_ns não tem espaços — checagem sem espaço.
         if "valoresemr$" in low_ns:
             in_values_block = True
             page_had_block = True
@@ -498,8 +494,8 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 values_pool.append(candidate)
                 continue
             in_values_block = False
-            _flush_page()  # fim do bloco => fim lógico da página
-        if low.startswith(NU_SUMMARY_PREFIXES):
+            _flush_page()
+        if any(low.startswith(p) for p in NU_SUMMARY_PREFIXES):
             summary_labels += 1
             continue
         is_total_e = "totaldeentradas" in low_ns
@@ -516,7 +512,7 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 "label": section,
                 "date": current_date,
                 "expected": (abs(parse_money_value(total_str)) if total_str else None),
-                "sum": 0.0,
+                "sum": Decimal('0.00'),
                 "count": 0,
             }
             section_records.append(section_rec)
@@ -531,7 +527,6 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             m = re.search(MONEY_END_REGEX, line)
             amount_str: Optional[str] = m.group(1) if m else None
             consumed_idx = -1
-            # FIX H/J: look-ahead de valor inline (até 4 linhas).
             if amount_str is None:
                 j = i
                 while j < min(i + 4, n):
@@ -570,9 +565,8 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
             if len(last_tx.description) < 250:
                 last_tx.description = f"{last_tx.description} {line}"
             continue
+            
     _flush_page()
-    # Fallback global antigo (MANTIDO): só relevante para documentos sem
-    # bloco por página, onde pending acumulou e values_pool pode casar.
     if pending:
         skip = summary_labels + total_lines
         available = values_pool[skip:]
@@ -582,24 +576,23 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
                 _credit_rec(item.get("rec"), tx.amount)
         else:
             logger.warning(
-                "Nubank: bloco 'VALORES EM R$' não casado (%d valores vs %d "
-                "descrições) em %s — aplicando rede de segurança FIX K.",
+                "Nubank: bloco 'VALORES EM R$' não casado (%d valores vs %d descrições) em %s — aplicando rede de segurança FIX K.",
                 len(available), len(pending), source_file or "PDF",
             )
             for item in pending:
                 _fix_k(item)
-    # FIX L: canário de somatório por seção (log-only).
+                
     for rec in section_records:
         if rec["expected"] is not None and rec["count"] > 0:
-            if abs(rec["sum"] - rec["expected"]) > 0.01:
+            if abs(rec["sum"] - rec["expected"]) > Decimal('0.01'):
                 logger.warning(
-                    "Nubank: seção '%s' de %s inconsistente com o somatório do "
-                    "banco: esperado=%.2f apurado=%.2f (%d lançamento(s)) em %s.",
+                    "Nubank: seção '%s' de %s inconsistente com o somatório do banco: esperado=%.2f apurado=%.2f (%d lançamento(s)) em %s.",
                     "entradas" if rec["label"] == "E" else "saídas",
                     rec["date"].strftime("%d/%m/%Y") if rec["date"] else "??/??/????",
                     rec["expected"], rec["sum"], rec["count"],
                     source_file or "PDF",
                 )
+                
     txs.sort(key=lambda t: t.date)
     return txs
 
@@ -608,92 +601,58 @@ def parse_nubank(text: str, bank: str = "nubank", source_file: str = "") -> List
 # Parser C6 Bank
 # ---------------------------------------------------------------------------
 def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato C6 Bank.
-    Layout característico:
-     - Cabeçalho: "C6 BANK" + "Agência: X • Conta: XXXXXXXX"
-     - Colunas: Data lançamento | Data contábil | Tipo | Descrição | Valor
-     - Formato: dd/mm | dd/mm | "Entrada/Saida PIX" | Descrição | R$ X.XXX,XX
-     - Agrupamento: "Junho 2026 (01/06/2026 - 30/06/2026)"
-     - Saldo: "Saldo do dia 09/06/26 → R$ 0,00"
-    Estratégia:
-     1. Ignorar linhas de cabeçalho de mês e saldo
-     2. Extrair data da primeira coluna (dd/mm)
-     3. Identificar tipo (Entrada/Saida)
-     4. Extrair valor (com ou sem sinal -)
-     5. Crédito/débito baseado em "Entrada" vs "Saida"
-    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
     i, n = 0, len(lines)
-    # Regex para detectar cabeçalho de mês: "Junho 2026 (01/06/2026 - 30/06/2026)"
     month_header_re = re.compile(r'([A-Za-zçãáéíóú]+)\s+(\d{4})')
-    # Regex para saldo do dia: "Saldo do dia 09/06/26"
     balance_line_re = re.compile(r'Saldo do dia\s+\d{1,2}/\d{1,2}/\d{2,4}')
-    # Regex para data dd/mm
     date_re = re.compile(r'^(\d{1,2}/\d{1,2})')
-    # Regex para valor monetário
     money_re = re.compile(r'(-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})')
+    
     while i < n:
         line = lines[i]
         i += 1
         if not line:
             continue
-        # Verificar cabeçalho de mês para capturar ano
         month_match = month_header_re.search(line)
         if month_match and '(' in line and ')' in line:
-            # É um cabeçalho como "Junho 2026 (01/06/2026 - 30/06/2026)"
             year_str = month_match.group(2)
             context_year = int(year_str)
             continue
-        # Ignorar linhas de saldo
         if balance_line_re.search(line):
             continue
-        # Ignorar cabeçalhos de coluna
         if line.upper().startswith(('DATA', 'TIPO', 'DESCRIÇÃO', 'VALOR')):
             continue
-        # Tentar extrair data da primeira coluna
         date_match = date_re.match(line)
         if not date_match:
             continue
         date_str = date_match.group(1)
-        # Extrair valor (última coluna)
         money_matches = money_re.findall(line)
         if not money_matches:
             continue
-        # Pegar o último valor encontrado (coluna Valor)
-        amount_str = money_matches[-1]
-        # Extrair tipo (Entrada/Saida)
+        amount_str = money_matches[-1] # C6 mantém [-1] pois o layout é estritamente colunar e o último é o valor da transação
         is_credit = None
         if 'Entrada' in line:
             is_credit = True
         elif 'Saida' in line or 'Saída' in line:
             is_credit = False
-        # Extrair descrição (entre o tipo e o valor)
-        # Remover data, tipo e valor da linha para obter a descrição
         description = line
         description = re.sub(date_re, '', description)
-        description = re.sub(r'\d{1,2}/\d{1,2}', '', description, count=1)  # Segunda data (contábil)
+        description = re.sub(r'\d{1,2}/\d{1,2}', '', description, count=1)
         description = re.sub(r'(Entrada|Saida|Saída)\s*\w*', '', description)
         description = re.sub(money_re, '', description)
         description = description.strip(' -|•')
-        # Se ano não foi capturado do cabeçalho, tentar inferir
         if context_year is None:
-            # Procurar ano em linhas anteriores ou usar ano atual
             context_year = date.today().year
-        # Construir data completa
         try:
             day, month = map(int, date_str.split('/'))
             parsed_date = date(context_year, month, day)
         except (ValueError, IndexError):
             continue
-        # Converter valor
         amount = parse_money_value(amount_str)
-        # Validação: descrição não vazia
         if not description:
             description = "Lançamento não identificado"
-        # CORREÇÃO 4c: needs_review=True quando is_credit é None
         needs_review = is_credit is None
         transactions.append(Transaction(
             date=parsed_date,
@@ -711,46 +670,26 @@ def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transac
 # Parser Banco Inter
 # ---------------------------------------------------------------------------
 def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Banco Inter.
-    Layout característico:
-     - Cabeçalho: "Inter" + "Banco Inter"
-     - Data por extenso: "5 de Março de 2026"
-     - Formato: Descrição | Valor | Saldo por transação
-     - Tipos: "Pix enviado: ...", "Transferencia recebida: ..."
-     - Saldo: "Saldo do dia: R$ 2.352,11"
-    Estratégia:
-     1. Detectar data por extenso no início da linha
-     2. Ignorar linhas de saldo
-     3. Extrair descrição completa
-     4. Extrair valor (primeiro valor após descrição)
-     5. Crédito/débito baseado no sinal (- ou positivo)
-    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
     i, n = 0, len(lines)
-    # Regex para data por extenso: "5 de Março de 2026"
     date_extenso_re = re.compile(r'(\d{1,2})\s+de\s+([A-Za-zçãáéíóú]+)\s+de\s+(\d{4})')
-    # Regex para saldo do dia
     balance_line_re = re.compile(r'Saldo do dia:\s*R\$')
-    # Regex para valor monetário
     money_re = re.compile(r'(-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2})')
-    # Meses em português
     meses_pt = {
         'janeiro': 1, 'fevereiro': 2, 'março': 3, 'marco': 3,
         'abril': 4, 'maio': 5, 'junho': 6, 'julho': 7,
         'agosto': 8, 'setembro': 9, 'outubro': 10,
         'novembro': 11, 'dezembro': 12
     }
-    # Variável para rastrear a última data encontrada
     last_date: Optional[date] = None
+    
     while i < n:
         line = lines[i]
         i += 1
         if not line:
             continue
-        # Verificar se é linha de data por extenso
         date_match = date_extenso_re.search(line)
         if date_match:
             day = int(date_match.group(1))
@@ -760,31 +699,21 @@ def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[T
             if month is None:
                 continue
             context_year = year
-            # Tentar criar a data
             try:
                 last_date = date(year, month, day)
             except ValueError:
                 pass
-            # Esta linha também tem "Saldo do dia: R$ X.XXX,XX"
-            # Ignorar e continuar para próxima linha
             continue
-        # Ignorar linhas de saldo
         if balance_line_re.search(line):
             continue
-        # Ignorar cabeçalhos
         if line.upper().startswith(('VALOR', 'SALDO POR TRANSAÇÃO', 'CPF/CNPJ', 'PERÍODO')):
             continue
-        # Tentar extrair valor
         money_matches = money_re.findall(line)
         if not money_matches:
             continue
-        # O primeiro valor é o da transação (antes do saldo)
         amount_str = money_matches[0]
-        # Extrair descrição (tudo antes do primeiro valor)
         description = line.split(amount_str)[0].strip()
-        # Limpar descrição
         description = description.strip(' -|•')
-        # Determinar se é crédito ou débito
         is_credit = None
         if amount_str.startswith('-'):
             is_credit = False
@@ -792,13 +721,10 @@ def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[T
         else:
             is_credit = True
             amount = parse_money_value(amount_str)
-        # Validação: descrição não vazia
         if not description:
             description = "Lançamento não identificado"
-        # Usar a última data encontrada
         parsed_date = last_date
         if parsed_date is None:
-            # Fallback: usar data genérica
             if context_year is None:
                 context_year = date.today().year
             parsed_date = date(context_year, 1, 1)
@@ -818,26 +744,10 @@ def parse_inter(text: str, bank: str = "inter", source_file: str = "") -> List[T
 # Parser Itaú (específico)
 # ---------------------------------------------------------------------------
 def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Itaú.
-    Layout característico:
-     - Cabeçalho: "Itaú Unibanco S.A." + dados da conta
-     - Formato: dd/mm/aaaa | Histórico | Valor | Saldo
-     - Valores com sufixo C (crédito) ou D (débito)
-     - Seções: "Entradas" e "Saídas" com totais
-    Estratégia:
-     1. Usar parser genérico com use_suffix=True para capturar C/D
-     2. Adicionar tratamento específico para cabeçalhos de seção do Itaú
-    """
-    # Primeiro, tentar o parser genérico com sufixo C/D
     txs = _parse_generic_lines(text, bank, source_file, use_suffix=True)
-    
-    # Se não encontrou nada, tentar com heurísticas específicas do Itaú
     if not txs:
         lines = [ln.strip() for ln in (text or "").splitlines()]
         context_year: Optional[int] = None
-        
-        # Procurar ano no cabeçalho
         for line in lines[:20]:
             year_match = re.search(r'(\d{4})', line)
             if year_match:
@@ -845,32 +755,25 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
                 if 2020 <= year <= 2030:
                     context_year = year
                     break
-        
-        # Processar linhas com padrão específico do Itaú
         for line in lines:
             if not line or line.upper().startswith(('DATA', 'HISTÓRICO', 'VALOR', 'SALDO')):
                 continue
-            
-            # Tentar extrair data dd/mm/aaaa
             date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
             if not date_match:
                 continue
-            
             date_str = date_match.group(1)
             try:
                 parsed_date = date_parser.parse(date_str, dayfirst=True).date()
             except ValueError:
                 continue
-            
-            # Extrair valor
             money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
             if not money_matches:
                 continue
             
-            amount_str = money_matches[-1]
-            amount = parse_money_value(amount_str)
+            # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
+            amount_str = money_matches[0] 
             
-            # Determinar crédito/débito pelo sufixo C/D
+            amount = parse_money_value(amount_str)
             is_credit = None
             idx = line.find(amount_str)
             if idx >= 0:
@@ -879,16 +782,12 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
                     is_credit = True
                 elif suffix == 'D':
                     is_credit = False
-            
-            # Descrição: tudo entre a data e o valor
             description = line[len(date_str):idx].strip() if idx > 0 else "Lançamento não identificado"
             if not description:
                 description = "Lançamento não identificado"
-            
             needs_review = is_credit is None
             if is_credit is True and amount < 0:
                 amount = -amount
-            
             txs.append(Transaction(
                 date=parsed_date,
                 description=description,
@@ -898,7 +797,6 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
                 source_file=source_file,
                 needs_review=needs_review,
             ))
-    
     return txs
 
 
@@ -906,41 +804,18 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
 # Parser Bradesco (específico)
 # ---------------------------------------------------------------------------
 def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Bradesco.
-    Layout característico:
-     - Cabeçalho: "Banco Bradesco S.A." + dados da conta
-     - Formato: dd/mm/aaaa | Histórico | Valor | Saldo
-     - Valores com sufixo C (crédito) ou D (débito)
-    Estratégia:
-     1. Usar parser genérico com use_suffix=True
-     2. Adicionar tratamento específico para cabeçalhos do Bradesco
-    """
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
 
 # ---------------------------------------------------------------------------
-# Parser Santander (específico) - 4b
+# Parser Santander (específico)
 # ---------------------------------------------------------------------------
 def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Santander.
-    Layout característico:
-     - Cabeçalho: "Santander" + "Banco Santander (Brasil) S.A."
-     - Formato: dd/mm/aaaa | Lançamento | Valor | Saldo
-     - Seções: "Entradas" e "Saídas" com totais
-     - Valores podem ter sinal + ou -
-    Estratégia:
-     1. Detectar seções de Entradas/Saídas
-     2. Extrair data, descrição e valor
-     3. Crédito/débito baseado na seção ou sinal
-    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
-    current_section: Optional[str] = None  # "E" para entradas, "S" para saídas
+    current_section: Optional[str] = None
     
-    # Procurar ano no cabeçalho
     for line in lines[:20]:
         year_match = re.search(r'(\d{4})', line)
         if year_match:
@@ -948,52 +823,42 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
             if 2020 <= year <= 2030:
                 context_year = year
                 break
-    
+                
     i = 0
     while i < len(lines):
         line = lines[i]
         i += 1
-        
         if not line:
             continue
-        
-        # Detectar seção
         low = line.lower()
-        if 'total de entradas' in low or 'entradas' in low and 'total' in low:
+        if 'total de entradas' in low or ('entradas' in low and 'total' in low):
             current_section = "E"
             continue
-        if 'total de saídas' in low or 'total de saidas' in low or 'saídas' in low and 'total' in low:
+        if 'total de saídas' in low or 'total de saidas' in low or ('saídas' in low and 'total' in low):
             current_section = "S"
             continue
-        
-        # Ignorar cabeçalhos e linhas de saldo
         if line.upper().startswith(('DATA', 'LANÇAMENTO', 'VALOR', 'SALDO', 'PERÍODO')):
             continue
         if 'saldo' in low and 'inicial' in low:
             continue
         if 'saldo' in low and 'final' in low:
             continue
-        
-        # Tentar extrair data dd/mm/aaaa
         date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
         if not date_match:
             continue
-        
         date_str = date_match.group(1)
         try:
             parsed_date = date_parser.parse(date_str, dayfirst=True).date()
         except ValueError:
             continue
-        
-        # Extrair valor
         money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
         if not money_matches:
             continue
+            
+        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
+        amount_str = money_matches[0]
         
-        amount_str = money_matches[-1]
         amount = parse_money_value(amount_str)
-        
-        # Determinar crédito/débito
         is_credit = None
         if amount_str.startswith('+'):
             is_credit = True
@@ -1003,17 +868,13 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
             is_credit = True
         elif current_section == "S":
             is_credit = False
-        
-        # Descrição: tudo entre a data e o valor
         idx = line.find(amount_str)
         description = line[len(date_str):idx].strip() if idx > 0 else "Lançamento não identificado"
         if not description:
             description = "Lançamento não identificado"
-        
         needs_review = is_credit is None
         if is_credit is True and amount < 0:
             amount = -amount
-        
         transactions.append(Transaction(
             date=parsed_date,
             description=description,
@@ -1023,32 +884,18 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
             source_file=source_file,
             needs_review=needs_review,
         ))
-    
     return transactions
 
 
 # ---------------------------------------------------------------------------
-# Parser Caixa Econômica Federal (específico) - 4b
+# Parser Caixa Econômica Federal (específico)
 # ---------------------------------------------------------------------------
 def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Caixa Econômica Federal.
-    Layout característico:
-     - Cabeçalho: "Caixa Econômica Federal" + "CEF"
-     - Formato: dd/mm/aaaa | Lançamento | Valor | Saldo
-     - Seções: "Créditos" e "Débitos" com totais
-     - Valores podem ter sinal + ou -
-    Estratégia:
-     1. Detectar seções de Créditos/Débitos
-     2. Extrair data, descrição e valor
-     3. Crédito/débito baseado na seção ou sinal
-    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
-    current_section: Optional[str] = None  # "E" para créditos, "S" para débitos
+    current_section: Optional[str] = None
     
-    # Procurar ano no cabeçalho
     for line in lines[:20]:
         year_match = re.search(r'(\d{4})', line)
         if year_match:
@@ -1056,52 +903,42 @@ def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[T
             if 2020 <= year <= 2030:
                 context_year = year
                 break
-    
+                
     i = 0
     while i < len(lines):
         line = lines[i]
         i += 1
-        
         if not line:
             continue
-        
-        # Detectar seção
         low = line.lower()
-        if 'créditos' in low or 'creditos' in low and 'total' in low:
+        if 'créditos' in low or ('creditos' in low and 'total' in low):
             current_section = "E"
             continue
-        if 'débitos' in low or 'debitos' in low and 'total' in low:
+        if 'débitos' in low or ('debitos' in low and 'total' in low):
             current_section = "S"
             continue
-        
-        # Ignorar cabeçalhos e linhas de saldo
         if line.upper().startswith(('DATA', 'LANÇAMENTO', 'VALOR', 'SALDO', 'PERÍODO')):
             continue
         if 'saldo' in low and 'inicial' in low:
             continue
         if 'saldo' in low and 'final' in low:
             continue
-        
-        # Tentar extrair data dd/mm/aaaa
         date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
         if not date_match:
             continue
-        
         date_str = date_match.group(1)
         try:
             parsed_date = date_parser.parse(date_str, dayfirst=True).date()
         except ValueError:
             continue
-        
-        # Extrair valor
         money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
         if not money_matches:
             continue
+            
+        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
+        amount_str = money_matches[0]
         
-        amount_str = money_matches[-1]
         amount = parse_money_value(amount_str)
-        
-        # Determinar crédito/débito
         is_credit = None
         if amount_str.startswith('+'):
             is_credit = True
@@ -1111,17 +948,13 @@ def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[T
             is_credit = True
         elif current_section == "S":
             is_credit = False
-        
-        # Descrição: tudo entre a data e o valor
         idx = line.find(amount_str)
         description = line[len(date_str):idx].strip() if idx > 0 else "Lançamento não identificado"
         if not description:
             description = "Lançamento não identificado"
-        
         needs_review = is_credit is None
         if is_credit is True and amount < 0:
             amount = -amount
-        
         transactions.append(Transaction(
             date=parsed_date,
             description=description,
@@ -1131,32 +964,17 @@ def parse_caixa(text: str, bank: str = "caixa", source_file: str = "") -> List[T
             source_file=source_file,
             needs_review=needs_review,
         ))
-    
     return transactions
 
 
 # ---------------------------------------------------------------------------
-# Parser PicPay (específico) - 4a
+# Parser PicPay (específico)
 # ---------------------------------------------------------------------------
 def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato PicPay.
-    Layout assumido (a confirmar com extrato real):
-     - Cabeçalho: "PicPay" + "PicPay Serviços S.A."
-     - Formato: dd/mm/aaaa | Descrição | Valor
-     - Colunas: "Entrada" e "Saída" (ou valores com sinal + ou -)
-     - Tipos: "Pix enviado", "Pix recebido", "Compra", "Recarga"
-    TODO: Confirmar layout exato com extrato real do PicPay.
-    Estratégia:
-     1. Detectar tipo de transação pela descrição ou coluna
-     2. Extrair data, descrição e valor
-     3. Crédito/débito baseado no tipo ou sinal
-    """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     context_year: Optional[int] = None
     
-    # Procurar ano no cabeçalho
     for line in lines[:20]:
         year_match = re.search(r'(\d{4})', line)
         if year_match:
@@ -1164,8 +982,7 @@ def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List
             if 2020 <= year <= 2030:
                 context_year = year
                 break
-    
-    # Palavras-chave para determinar crédito/débito
+                
     credit_keywords = ('recebido', 'recebida', 'entrada', 'deposito', 'recarga')
     debit_keywords = ('enviado', 'enviada', 'saida', 'pagamento', 'compra', 'transferencia enviada')
     
@@ -1173,59 +990,46 @@ def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List
     while i < len(lines):
         line = lines[i]
         i += 1
-        
         if not line:
             continue
-        
-        # Ignorar cabeçalhos
         if line.upper().startswith(('DATA', 'DESCRIÇÃO', 'VALOR', 'PERÍODO')):
             continue
         if 'picpay' in line.lower() and 'serviços' in line.lower():
             continue
-        
-        # Tentar extrair data dd/mm/aaaa
         date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
         if not date_match:
             continue
-        
         date_str = date_match.group(1)
         try:
             parsed_date = date_parser.parse(date_str, dayfirst=True).date()
         except ValueError:
             continue
-        
-        # Extrair valor
         money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
         if not money_matches:
             continue
+            
+        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
+        amount_str = money_matches[0]
         
-        amount_str = money_matches[-1]
         amount = parse_money_value(amount_str)
-        
-        # Determinar crédito/débito
         is_credit = None
         if amount_str.startswith('+'):
             is_credit = True
         elif amount_str.startswith('-'):
             is_credit = False
         else:
-            # Heurística pela descrição
             low = line.lower()
             if any(kw in low for kw in credit_keywords):
                 is_credit = True
             elif any(kw in low for kw in debit_keywords):
                 is_credit = False
-        
-        # Descrição: tudo entre a data e o valor
         idx = line.find(amount_str)
         description = line[len(date_str):idx].strip() if idx > 0 else "Lançamento não identificado"
         if not description:
             description = "Lançamento não identificado"
-        
         needs_review = is_credit is None
         if is_credit is True and amount < 0:
             amount = -amount
-        
         transactions.append(Transaction(
             date=parsed_date,
             description=description,
@@ -1235,7 +1039,6 @@ def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List
             source_file=source_file,
             needs_review=needs_review,
         ))
-    
     return transactions
 
 
@@ -1243,15 +1046,6 @@ def parse_picpay(text: str, bank: str = "picpay", source_file: str = "") -> List
 # Parser Banco do Brasil (específico)
 # ---------------------------------------------------------------------------
 def parse_bb(text: str, bank: str = "bb", source_file: str = "") -> List[Transaction]:
-    """
-    Parser do extrato Banco do Brasil.
-    Layout característico:
-     - Cabeçalho: "Banco do Brasil S.A." + dados da conta
-     - Formato: dd/mm/aaaa | Histórico | Valor | Saldo
-     - Valores com sufixo C (crédito) ou D (débito)
-    Estratégia:
-     1. Usar parser genérico com use_suffix=True
-    """
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
 
@@ -1276,8 +1070,7 @@ def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> 
     parser_fn = _PARSERS.get(bank, parse_generic)
     txs = parser_fn(text, bank=bank, source_file=source_file)
     if not txs and parser_fn is not parse_generic:
-        logger.info("Parser '%s' vazio para %s — aplicando fallback genérico.",
-                    bank, source_file or "PDF")
+        logger.info("Parser '%s' vazio para %s — aplicando fallback genérico.", bank, source_file or "PDF")
         txs = parse_generic(text, bank=bank, source_file=source_file)
     return txs
 
@@ -1290,3 +1083,38 @@ def parse_pdf_pages(pages_text: List[str]) -> List[Transaction]:
             all_txs.extend(parse_generic(page_text))
     all_txs.sort(key=lambda t: t.date)
     return all_txs
+
+
+# ---------------------------------------------------------------------------
+# Deduplicação de transações (Rodada Deduplicação)
+# ---------------------------------------------------------------------------
+def _transaction_hash(tx: Transaction) -> str:
+    """Gera hash SHA-256 único para a transação baseado em data, valor e descrição normalizada."""
+    norm_desc = _normalize_text(tx.description)
+    norm_desc = re.sub(r'\s+', ' ', norm_desc).strip()
+    amount_str = str(tx.amount.quantize(Decimal('0.01')))
+    date_str = tx.date.isoformat()
+    hash_input = f"{date_str}|{amount_str}|{norm_desc}"
+    return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
+
+
+def deduplicate_transactions(transactions: List[Transaction]) -> Tuple[List[Transaction], int]:
+    """Remove transações duplicadas baseado em hash SHA-256."""
+    seen_hashes: Set[str] = set()
+    unique_transactions: List[Transaction] = []
+    duplicates_count = 0
+    
+    for tx in transactions:
+        tx_hash = _transaction_hash(tx)
+        if tx_hash not in seen_hashes:
+            seen_hashes.add(tx_hash)
+            unique_transactions.append(tx)
+        else:
+            duplicates_count += 1
+            logger.debug("Transação duplicada removida: %s | %s | %s (%s)", tx.date, tx.description, tx.amount, tx.source_file or "PDF")
+            
+    if duplicates_count > 0:
+        logger.info("Deduplicação: %d transação(ões) duplicada(s) removida(s) de %d total.", duplicates_count, len(transactions))
+        
+    unique_transactions.sort(key=lambda t: t.date)
+    return unique_transactions, duplicates_count

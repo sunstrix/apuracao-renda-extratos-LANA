@@ -26,7 +26,13 @@ RODADA 3 (CORREÇÃO CRÍTICA DE REGRAS):
 - Bloqueio explícito de transações com is_credit == False (débitos/compras),
   garantindo que NENHUM débito entre na apuração, mesmo que o parser tenha
   atribuído um valor positivo por engano.
+
+RODADA ATUAL (CORREÇÃO DE FRONTIERA DE PALAVRA):
+- Substituição da correspondência por substring pura por regex com fronteira
+  de palavra (\b), evitando falsos positivos de palavras curtas (ex: "bet",
+  "cdb") casando dentro de nomes próprios legítimos (ex: "ELIZABETH", "ACDBA").
 """
+
 import json
 import os
 import re
@@ -87,6 +93,8 @@ DEFAULT_KEYWORDS: Dict[str, List[str]] = {
 # Cache simples do JSON de palavras-chave, invalidado por mtime do arquivo.
 _KEYWORDS_CACHE: Dict[str, object] = {"mtime": None, "data": None}
 
+# Cache de regex compiladas para performance (evita recompilação a cada chamada).
+_REGEX_CACHE: Dict[str, re.Pattern] = {}
 
 def load_exclusion_keywords() -> Dict[str, List[str]]:
     """
@@ -116,12 +124,28 @@ def load_exclusion_keywords() -> Dict[str, List[str]]:
         logger.error("Erro ao ler arquivo de palavras-chave: %s. Usando fallback.", e)
         return DEFAULT_KEYWORDS
 
-
 def normalize_text(text: str) -> str:
     """Remove acentos e baixa caixa para comparação semântica."""
     nfkd = unicodedata.normalize("NFKD", text or "")
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower().strip()
 
+def _compile_keyword_regex(word: str) -> re.Pattern:
+    """
+    Compila e cacheia uma regex com fronteira de palavra para a palavra-chave.
+    Usa re.escape para segurança contra caracteres especiais.
+    """
+    if word not in _REGEX_CACHE:
+        pattern = r'\b' + re.escape(normalize_text(word)) + r'\b'
+        _REGEX_CACHE[word] = re.compile(pattern)
+    return _REGEX_CACHE[word]
+
+def _keyword_matches(keyword: str, description_normalized: str) -> bool:
+    """
+    Verifica se a palavra-chave casam na descrição usando fronteira de palavra.
+    Evita falsos positivos de substring (ex: "bet" em "ELIZABETH").
+    """
+    regex = _compile_keyword_regex(keyword)
+    return bool(regex.search(description_normalized))
 
 def _holder_tokens(name: str) -> List[str]:
     """
@@ -129,7 +153,6 @@ def _holder_tokens(name: str) -> List[str]:
     Ex.: "Davi Herculano e Silva" -> ["davi", "herculano", "silva"].
     """
     return [t for t in re.split(r"[^a-z0-9]+", normalize_text(name)) if len(t) >= 3]
-
 
 def _holder_matches(holder_name: str, description: str) -> bool:
     """
@@ -162,7 +185,6 @@ def _holder_matches(holder_name: str, description: str) -> bool:
     hits = sum(1 for w in holder_words if w in desc_tokens)
     
     return hits >= 2
-
 
 def evaluate_transaction(
     transaction: Transaction,
@@ -229,20 +251,20 @@ def evaluate_transaction(
             transaction.source_file or "PDF",
         )
 
-    # 4) Regras automáticas por palavras-chave (correspondência parcial/substring).
+    # 4) Regras automáticas por palavras-chave (com fronteira de palavra).
     keywords = load_exclusion_keywords()
     norm = normalize_text(transaction.description)
     
     for word in keywords.get("same_ownership", []):
-        if normalize_text(word) in norm:
+        if _keyword_matches(word, norm):
             return True, "Transferência de mesma titularidade (palavra-chave)"
             
     for word in keywords.get("investments", []):
-        if normalize_text(word) in norm:
+        if _keyword_matches(word, norm):
             return True, "Resgate/Rendimento de aplicação financeira"
             
     for word in keywords.get("gambling", []):
-        if normalize_text(word) in norm:
+        if _keyword_matches(word, norm):
             return True, "Crédito de aposta/jogo de azar"
 
     return False, "Entrada válida de renda"

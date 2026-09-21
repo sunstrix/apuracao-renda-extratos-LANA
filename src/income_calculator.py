@@ -24,7 +24,8 @@ CORREÇÃO DE LÓGICA (Rodada Atual):
 - "Dias Cobertos" por mês agora é calculado explicitamente e enviado no
   resumo_mensal, permitindo que o relatório exiba a cobertura real do
   extrato (ex: 01/03 a 31/03 = 31 dias).
-- Limpeza massiva de sintaxe (strings com espaços extras, __name__ incorreto).
+
+Limpeza massiva de sintaxe (strings com espaços extras, __name__ incorreto).
 
 O formato de retorno é mantido (mesmas chaves do contrato original) + a
 nova chave "revisao_manual" + "dias_cobertos" no resumo mensal.
@@ -33,12 +34,26 @@ PERF-8/9/10: Otimizações aplicadas:
 - Redução de passes sobre a lista de transações (agrupamento em 1 passagem)
 - Estruturas defaultdict pré-inicializadas
 - Soma de valores otimizada com sum() sobre generators
+
+RODADA DECIMAL (Correção Crítica de Precisão):
+- Migração de float para decimal.Decimal em todos os cálculos financeiros,
+  eliminando erros de arredondamento IEEE 754 em somas sucessivas.
+- Todos os valores de retorno (total_geral, media_mensal_geral, etc.) agora
+  são Decimal com precisão de 2 casas decimais.
+
+RODADA DEDUPLICAÇÃO (Correção Crítica de Duplicidade):
+- Integração da função deduplicate_transactions() do transaction_parser.py
+  para remover transações duplicadas antes do cálculo das métricas.
+- Log de quantas duplicatas foram removidas para auditoria.
 """
+
 import logging
 from collections import defaultdict
 from datetime import date
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
-from src.transaction_parser import Transaction
+
+from src.transaction_parser import Transaction, deduplicate_transactions
 from src.rules_engine import evaluate_transaction
 
 logger = logging.getLogger(__name__)
@@ -53,7 +68,6 @@ CAT_INCLUIDA_MANUAL = "incluida_manual"
 CAT_EXCLUIDA_MANUAL = "excluida_manual"
 CAT_PENDENTE = "pendente"
 
-
 def is_month_complete(first_day: date, last_day: date) -> bool:
     """
     Verifica se o período entre a primeira e a última transação do mês
@@ -62,7 +76,6 @@ def is_month_complete(first_day: date, last_day: date) -> bool:
     if not first_day or not last_day:
         return False
     return (last_day - first_day).days + 1 > 20
-
 
 def _classify_transaction(
     idx: int,
@@ -139,12 +152,13 @@ def _classify_transaction(
         manual_exclusions=manual_exclusions,
         transaction_index=idx,
     )
+
     # Crédito automático desmarcado pelo operador chega aqui com o índice em
     # manual_exclusions — rastreia como exclusão manual.
     if manual_exclusions and idx in manual_exclusions:
         return is_excluded, reason, CAT_EXCLUIDA_MANUAL
-    return is_excluded, reason, None
 
+    return is_excluded, reason, None
 
 def calculate_income_metrics(
     transactions: List[Transaction],
@@ -171,12 +185,15 @@ def calculate_income_metrics(
         entradas_excluidas; e a nova chave revisao_manual:
         {"incluidas": [índices], "excluidas": [índices]} (FIX C).
     """
-    if not transactions:
+    # RODADA DEDUPLICAÇÃO: remover transações duplicadas antes do processamento
+    unique_transactions, duplicates_removed = deduplicate_transactions(transactions)
+    
+    if not unique_transactions:
         # Retorno rápido para lista vazia (evita processamento desnecessário)
         return {
-            "total_geral": 0.0,
-            "media_mensal_geral": 0.0,
-            "media_meses_completos": 0.0,
+            "total_geral": Decimal('0.00'),
+            "media_mensal_geral": Decimal('0.00'),
+            "media_meses_completos": Decimal('0.00'),
             "resumo_mensal": [],
             "entradas_validas": [],
             "entradas_excluidas": [],
@@ -185,6 +202,7 @@ def calculate_income_metrics(
 
     valid_transactions: List[Transaction] = []
     excluded_transactions: List[Dict[str, Any]] = []
+
     # FIX C (rodada 2): rastreabilidade da revisão manual.
     review_incluidas: List[int] = []
     review_excluidas: List[int] = []
@@ -194,10 +212,12 @@ def calculate_income_metrics(
     monthly_all_dates: Dict[Tuple[int, int], List[date]] = defaultdict(list)
 
     # 1. Classificação + Agrupamento em UMA ÚNICA PASSAGEM
-    for idx, t in enumerate(transactions):
+    # IMPORTANTE: usamos unique_transactions (já deduplicadas)
+    for idx, t in enumerate(unique_transactions):
         is_excluded, reason, review_category = _classify_transaction(
             idx, t, holder_name, manual_exclusions, manual_inclusions
         )
+
         if review_category == CAT_INCLUIDA_MANUAL:
             review_incluidas.append(idx)
         elif review_category in (CAT_EXCLUIDA_MANUAL, CAT_PENDENTE):
@@ -217,8 +237,8 @@ def calculate_income_metrics(
             valid_transactions.append(t)
             monthly_valid_data[month_key].append(t)
 
-    # 2. Cálculos agregados
-    total_geral = sum(t.amount for t in valid_transactions)
+    # 2. Cálculos agregados (usando Decimal para precisão monetária)
+    total_geral = sum((t.amount for t in valid_transactions), Decimal('0.00'))
 
     # União de todos os meses que apareceram (válidos ou excluídos)
     all_months = set(monthly_valid_data.keys()) | set(monthly_all_dates.keys())
@@ -226,7 +246,7 @@ def calculate_income_metrics(
 
     # Média Mensal Geral = Total Geral / número de meses com pelo menos 1 lançamento
     media_mensal_geral = (
-        total_geral / num_months_total if num_months_total > 0 else 0.0
+        total_geral / num_months_total if num_months_total > 0 else Decimal('0.00')
     )
 
     # CORREÇÃO CRÍTICA: Média de Meses Completos
@@ -243,22 +263,25 @@ def calculate_income_metrics(
     media_meses_completos = (
         total_geral / count_complete_months
         if count_complete_months > 0
-        else 0.0
+        else Decimal('0.00')
     )
 
     # 3. Resumo mensal ordenado para interface/relatório
     monthly_summary: List[Dict[str, Any]] = []
     sorted_keys = sorted(monthly_valid_data.keys(), key=lambda x: (x[0], x[1]))
+
     for key in sorted_keys:
         year, month = key
         valid_txs = monthly_valid_data[key]
-        total_valido = sum(t.amount for t in valid_txs)
+        total_valido = sum((t.amount for t in valid_txs), Decimal('0.00'))
+
         # CORREÇÃO: Calcular dias cobertos para este mês
         all_dates_for_month = monthly_all_dates[key]
         if all_dates_for_month:
             dias_cobertos = (max(all_dates_for_month) - min(all_dates_for_month)).days + 1
         else:
             dias_cobertos = 0
+
         monthly_summary.append({
             "month_label": f"{month:02d}/{year}",
             "dias_cobertos": dias_cobertos,

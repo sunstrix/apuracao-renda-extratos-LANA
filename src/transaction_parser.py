@@ -37,6 +37,11 @@ Implementação de deduplicação por hash SHA-256 da combinação
 de transações em extratos com períodos sobrepostos.
 Função deduplicate_transactions() exportada para uso pelo
 income_calculator.py.
+RODADA SANTANDER (Correção Crítica de Seções):
+Reescrita completa do parse_santander() com máquina de estados
+para delimitar seções. Agora processa APENAS a seção "Movimentação"
+da Conta Corrente, ignorando CDB/RDB, Índices Econômicos, Saldos
+por Período, e outras tabelas que NÃO são transações bancárias.
 """
 import re
 import logging
@@ -108,121 +113,305 @@ NU_DEBIT_HINTS = (
     "debito em conta ", "resgate de emprestimo ",
 )
 
-def _normalize_text(text: str) -> str:
-    """Remove acentos e baixa caixa para análise estatística/semântica."""
-    nfkd = unicodedata.normalize("NFKD", text or "")
-    return "".join(c for c in nfkd if unicodedata.category(c) != "Mn").lower()
+# ---------------------------------------------------------------------------
+# SANTANDER: Constantes e Filtros de Seção (RODADA SANTANDER)
+# ---------------------------------------------------------------------------
+SANTANDER_IGNORE_SECTIONS = (
+    "renda fixa", "cdb", "rdb", "minhas reservas", "aplicacao n", "aplicação n",
+    "indices economicos", "índices econômicos", "indices financeiros",
+    "saldos por periodo", "saldos por período", "compras com cartao",
+    "compras com cartão", "comprovantes de pagamento", "pacote de servicos",
+    "pacote de serviços", "fale conosco", "ouvidoria", "valor inicial",
+    "saldo anterior", "saldo atual", "valor liquido", "valor líquido",
+    "rendimento bruto", "valor ir/iof", "pagamento de juros",
+)
 
-def _month_from_token(token: str) -> Optional[int]:
-    return MESES_PT.get(_normalize_text(token)[:3].upper())
+SANTANDER_ANTI_LIXO_KEYWORDS = (
+    "% indexador", "data de vencimento", "dolar", "euro", "salario minimo",
+    "cdi", "ipca", "inpc", "igpm", "incc", "tr", "poupanca", "ibovespa",
+    "dólar", "euro", "salário mínimo", "selic", "referencia", "fechamento",
+    "valores referencia", "valores de referência",
+)
 
-def parse_money_value(text: str) -> Decimal:
-    """Converte 'R$ 1.234,56' / '-1.234,56' / '1500,00' -> Decimal."""
-    if not text:
-        return Decimal('0.00')
-    cleaned = text.replace("R$", "").replace("  ", " ").strip()
-    is_negative = cleaned.startswith("-") or cleaned.endswith("-")
-    cleaned = cleaned.replace("-", "").replace("+", "")
-    cleaned = cleaned.replace(".", "").replace(",", ".")
-    try:
-        value = Decimal(cleaned)
-        return -value if is_negative else value
-    except (InvalidOperation, ValueError):
-        return Decimal('0.00')
+def _normalize_for_matching(text: str) -> str:
+    """Normaliza texto para matching tolerante a ruído de OCR."""
+    text = _normalize_text(text)
+    text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
+    text = re.sub(r'(?<=\d)l(?=\d)', '1', text)
+    text = re.sub(r'[^\w\s]', '', text)
+    return text
 
-def _semantic_credit_debit(description: str) -> Optional[bool]:
-    low = _normalize_text(description)
-    if any(h in low for h in NU_CREDIT_HINTS):
-        return True
-    if any(h in low for h in NU_DEBIT_HINTS):
+def _detect_santander_section(line: str, previous_section: str) -> str:
+    """
+    Detecta em qual seção do extrato Santander a linha está.
+    
+    Retorna:
+        "movimentacao" - Conta Corrente (transações reais)
+        "renda_fixa" - CDB/RDB/Aplicações (IGNORAR)
+        "indices_economicos" - Tabelas de índices (IGNORAR)
+        "saldos_periodo" - Resumo de saldos (IGNORAR)
+        "cartao_debito" - Compras cartão (IGNORAR por enquanto)
+        "comprovantes" - Comprovantes pagamento (IGNORAR)
+        "outros" - Outras seções (IGNORAR)
+    """
+    line_norm = _normalize_for_matching(line)
+    line_lower = line.lower()
+    
+    # Gatilhos para seção de MOVIMENTAÇÃO (Conta Corrente)
+    if "conta corrente" in line_lower:
+        return "movimentacao"
+    if "movimentacao" in line_norm or "movimentação" in line_lower:
+        if previous_section in ("", "outros"):
+            return "movimentacao"
+    if re.search(r'^data\s+descricao', line_norm) or re.search(r'^data\s+lancamento', line_norm):
+        if previous_section in ("", "outros"):
+            return "movimentacao"
+    
+    # Gatilhos para RENDA FIXA / CDB / RDB
+    if any(kw in line_lower for kw in ["renda fixa", "cdb", "rdb", "minhas reservas"]):
+        return "renda_fixa"
+    if "aplicacao n" in line_norm or "aplicação n" in line_lower:
+        return "renda_fixa"
+    if "% indexador" in line_lower or "data de vencimento" in line_lower:
+        return "renda_fixa"
+    
+    # Gatilhos para ÍNDICES ECONÔMICOS
+    if any(kw in line_lower for kw in ["indices economicos", "índices econômicos", "indices financeiros"]):
+        return "indices_economicos"
+    if any(kw in line_lower for kw in ["dolar", "euro", "salario minimo", "cdi", "ipca"]):
+        if previous_section == "indices_economicos":
+            return "indices_economicos"
+    
+    # Gatilhos para SALDOS POR PERÍODO
+    if "saldos por periodo" in line_norm or "saldos por período" in line_lower:
+        return "saldos_periodo"
+    
+    # Gatilhos para CARTÃO DE DÉBITO
+    if "compras com cartao de debito" in line_norm or "compras com cartão de débito" in line_lower:
+        return "cartao_debito"
+    
+    # Gatilhos para COMPROVANTES
+    if "comprovantes de pagamento" in line_lower:
+        return "comprovantes"
+    
+    # Gatilhos para PACOTE DE SERVIÇOS / FALE CONOSCO
+    if "pacote de servicos" in line_norm or "pacote de serviços" in line_lower:
+        return "outros"
+    if "fale conosco" in line_lower or "ouvidoria" in line_lower:
+        return "outros"
+    
+    # Se estiver em uma seção de ignorar e não houver gatilho de mudança, mantém
+    if previous_section in ("renda_fixa", "indices_economicos", "saldos_periodo", "cartao_debito", "comprovantes", "outros"):
+        # Verifica se não é fim da seção (nova seção começando)
+        if "conta corrente" not in line_lower and "movimentacao" not in line_norm:
+            return previous_section
+    
+    return previous_section
+
+def _is_valid_santander_transaction(line: str, date_obj: Optional[date]) -> bool:
+    """
+    Valida se uma linha é uma transação real da Conta Corrente.
+    
+    Rejeita:
+    - Linhas com keywords de outras seções (CDB, índices, etc.)
+    - Datas futuras (ano >= 2027)
+    - Linhas que são cabeçalhos ou resumos
+    """
+    line_lower = line.lower()
+    line_norm = _normalize_for_matching(line)
+    
+    # Rejeita keywords de seções não-transacionais
+    if any(kw in line_lower for kw in SANTANDER_ANTI_LIXO_KEYWORDS):
         return False
-    return None
-
-def _decide_credit(amount_str: str, section: Optional[str], description: str):
-    """
-    Decide (is_credit, amount, needs_review) em camadas:
-    1) sinal explícito "+"/"-"; 2) seção (E/S); 3) semântica; 4) revisão.
-    """
-    amount = parse_money_value(amount_str)
-    if amount_str.startswith("-") or amount_str.startswith("+"):
-        return (not amount_str.startswith("-")), amount, False
-    if section == "E":
-        return True, abs(amount), False
-    if section == "S":
-        return False, -abs(amount), False
-    sem = _semantic_credit_debit(description)
-    if sem is True:
-        return True, abs(amount), False
-    if sem is False:
-        return False, -abs(amount), False
-    return None, amount, True
-
-def _infer_credit(line: str, amount_str: str) -> Optional[bool]:
-    """Heurística de crédito/débito para o parser genérico (bancos dd/mm)."""
-    idx = line.find(amount_str)
-    if idx >= 0:
-        after = line[idx + len(amount_str):].strip()[:1].upper()
-        if after in ("-", "D"):
+    if any(kw in line_lower for kw in SANTANDER_IGNORE_SECTIONS):
+        return False
+    
+    # Rejeita datas futuras (extratos são de 2025, no máximo 2026)
+    if date_obj and date_obj.year >= 2027:
+        return False
+    
+    # Rejeita linhas que são claramente cabeçalhos ou resumos
+    if re.search(r'^\s*data\s+descricao', line_norm):
+        return False
+    if "saldo em" in line_lower and re.search(r'\d{2}/\d{2}/\d{4}', line):
+        return False
+    
+    # Rejeita linhas sem descrição significativa (só data e valor)
+    date_match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
+    if date_match:
+        after_date = line[date_match.end():].strip()
+        # Se depois da data só tem número (valor), não é transação válida
+        if re.match(r'^[\d\.\,\-\s]+$', after_date):
             return False
-        if after in ("+", "C"):
-            return True
-    low = _normalize_text(line)
-    if any(w in low for w in ("credito", "recebido", "recebida", "entrada", "deposito", "salário", "salario")):
-        return True
-    if any(w in low for w in ("debito", "enviada", "enviado", "saida", "pagamento efetuado")):
-        return False
-    return None
+    
+    return True
 
-def _build_date(date_str: str, is_short: bool, context_year: Optional[int]) -> Optional[date]:
+def _parse_santander_movimentacao_line(line: str, context_year: int, 
+                                        previous_balance: Optional[Decimal]) -> Optional[Tuple[Transaction, Decimal]]:
+    """
+    Parse de uma linha da seção Movimentação do Santander.
+    
+    Formato esperado:
+    <Data> <Descrição> <Nº Documento> <Movimento (R$)> <Saldo (R$)>
+    
+    Retorna:
+        (Transaction, novo_saldo) ou None se não for transação válida
+    """
+    line = line.strip()
+    if not line:
+        return None
+    
+    # Normalização OCR
+    line = re.sub(r'(?<=\d)O(?=\d)', '0', line)
+    line = re.sub(r'(?<=\d)l(?=\d)', '1', line)
+    
+    # Extrai data (deve estar no início)
+    date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
+    if not date_match:
+        return None
+    
+    date_str = date_match.group(1)
     try:
-        if is_short:
-            year = context_year or date.today().year
-            return date_parser.parse(f"{date_str}/{year}", dayfirst=True).date()
-        return date_parser.parse(date_str, dayfirst=True).date()
-    except (ValueError, OverflowError):
-        return None
-
-def _clean_description(line: str, date_str: str, amount_str: str) -> str:
-    desc = line
-    if date_str:
-        desc = desc.replace(date_str, "", 1)
-    if amount_str:
-        desc = desc.replace(amount_str, "", 1)
-    desc = desc.replace("R$", "")
-    return re.sub(r'\s+', ' ', desc).strip(" -–|*")
-
-def _nu_date_from_line(line: str) -> Optional[date]:
-    """Data de cabeçalho Nubank com ruído de OCR (O1ABR2026, 1O0MAR2026...)."""
-    fixed = re.sub(r'(?<=\d)O(?=\d)', '0', line)
-    fixed = re.sub(r'O(?=\d)', '0', fixed)
-    m = NU_DATE_HDR_RE.search(fixed)
-    if not m:
-        return None
-    digits, mon, year = m.groups()
-    day = None
-    for cand in (digits, digits[:2], digits[-2:]):
-        if cand.isdigit() and 1 <= int(cand) <= 31:
-            day = int(cand)
-            break
-    if day is None:
-        return None
-    month = _month_from_token(mon)
-    if month is None:
-        return None
-    try:
-        return date(int(year), month, day)
+        tx_date = date_parser.parse(date_str, dayfirst=True).date()
     except ValueError:
         return None
-
-def _is_nu_header_line(line: str, low_ns: str) -> bool:
-    """True se a linha é cabeçalho (lançamento/data/seção/resumo)."""
-    return (
-        line.startswith(NU_TX_STARTERS)
-        or _nu_date_from_line(line) is not None
-        or "totaldeentradas" in low_ns
-        or "totaldesaidas" in low_ns
-        or any(low_ns.startswith(p) for p in NU_SUMMARY_PREFIXES)
+    
+    # Validação semântica
+    if not _is_valid_santander_transaction(line, tx_date):
+        return None
+    
+    # Extrai todos os valores monetários da linha
+    money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', line)
+    
+    if len(money_matches) < 1:
+        return None
+    
+    # Estratégia de parsing:
+    # - Último valor = saldo
+    # - Penúltimo valor = movimento (transação)
+    # - Se só tem 1 valor, ele é o movimento
+    
+    if len(money_matches) >= 2:
+        movement_str = money_matches[-2]
+        # saldo_str = money_matches[-1]  # Não usamos o saldo para nada agora
+    else:
+        movement_str = money_matches[0]
+    
+    # Parse do valor
+    movement_value = parse_money_value(movement_str)
+    
+    # Determina se é crédito ou débito
+    is_credit = None
+    if movement_str.startswith('-'):
+        is_credit = False
+        movement_value = -abs(movement_value)
+    elif movement_str.startswith('+'):
+        is_credit = True
+        movement_value = abs(movement_value)
+    else:
+        # Sem sinal explícito: usa contexto do saldo anterior (se disponível)
+        # ou heurística semântica
+        is_credit = _infer_credit(line, movement_str)
+        if is_credit is None:
+            is_credit = movement_value >= 0
+        if is_credit and movement_value < 0:
+            movement_value = -movement_value
+    
+    # Extrai descrição (texto entre a data e o movimento)
+    date_end_idx = date_match.end()
+    movement_idx = line.find(movement_str)
+    
+    if movement_idx > date_end_idx:
+        description = line[date_end_idx:movement_idx].strip()
+        # Remove possíveis números de documento no meio
+        description = re.sub(r'\b\d{3,}\b', '', description)
+        description = re.sub(r'\s+', ' ', description).strip()
+    else:
+        description = "Lançamento não identificado"
+    
+    # Limpeza final
+    description = description.strip(' -–|*')
+    if not description or len(description) < 3:
+        description = "Lançamento não identificado"
+    
+    tx = Transaction(
+        date=tx_date,
+        description=description,
+        amount=movement_value,
+        is_credit=is_credit,
+        bank="santander",
+        source_file="",
+        needs_review=(is_credit is None),
     )
+    
+    # Calcula novo saldo (aproximado, para uso em heurísticas futuras)
+    new_balance = None
+    if len(money_matches) >= 2:
+        try:
+            new_balance = parse_money_value(money_matches[-1])
+        except:
+            new_balance = None
+    
+    return (tx, new_balance)
+
+def _parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
+    """
+    Parser robusto para extratos Santander.
+    
+    Estratégia:
+    1. Máquina de estados para identificar seções
+    2. Processa APENAS a seção "Movimentação" da Conta Corrente
+    3. Ignora CDB/RDB, Índices Econômicos, Saldos por Período, etc.
+    4. Validação semântica rigorosa (rejeita datas futuras, keywords de lixo)
+    """
+    transactions: List[Transaction] = []
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    
+    current_section = ""
+    context_year: Optional[int] = None
+    previous_balance: Optional[Decimal] = None
+    
+    # Detecta ano de contexto nas primeiras linhas
+    for line in lines[:20]:
+        year_match = re.search(r'\b(202[0-9]|203[0-5])\b', line)
+        if year_match:
+            context_year = int(year_match.group(1))
+            break
+    
+    if context_year is None:
+        context_year = date.today().year
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        
+        if not line:
+            continue
+        
+        # Detecta seção atual
+        current_section = _detect_santander_section(line, current_section)
+        
+        # Só processa se estiver na seção de MOVIMENTAÇÃO
+        if current_section != "movimentacao":
+            continue
+        
+        # Tenta parsear como transação
+        result = _parse_santander_movimentacao_line(line, context_year, previous_balance)
+        
+        if result:
+            tx, new_balance = result
+            tx.source_file = source_file
+            transactions.append(tx)
+            if new_balance is not None:
+                previous_balance = new_balance
+    
+    return transactions
+
+# Alias para manter compatibilidade
+def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
+    """Wrapper para _parse_santander (mantém compatibilidade)."""
+    return _parse_santander(text, bank, source_file)
 
 # ---------------------------------------------------------------------------
 # Parser genérico (fallback universal)
@@ -254,6 +443,15 @@ def _parse_generic_lines(text: str, bank: str, source_file: str, use_suffix: boo
             continue
             
         if norm_line.upper().startswith(SKIP_LINE_PREFIXES):
+            i += 1
+            continue
+        
+        # FILTRO ANTI-LIXO (aplicado também ao genérico)
+        line_lower = norm_line.lower()
+        if any(kw in line_lower for kw in SANTANDER_ANTI_LIXO_KEYWORDS):
+            i += 1
+            continue
+        if any(kw in line_lower for kw in SANTANDER_IGNORE_SECTIONS):
             i += 1
             continue
             
@@ -298,6 +496,11 @@ def _parse_generic_lines(text: str, bank: str, source_file: str, use_suffix: boo
         
         parsed_date = _build_date(date_str, is_short, context_year)
         if parsed_date is None:
+            i += 1
+            continue
+        
+        # FILTRO DE DATAS FUTURAS (também no genérico)
+        if parsed_date.year >= 2027:
             i += 1
             continue
             
@@ -797,114 +1000,6 @@ def parse_itau(text: str, bank: str = "itau", source_file: str = "") -> List[Tra
 # ---------------------------------------------------------------------------
 def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> List[Transaction]:
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
-
-# ---------------------------------------------------------------------------
-# Parser Santander (específico)
-# ---------------------------------------------------------------------------
-def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
-    transactions: List[Transaction] = []
-    lines = [ln.strip() for ln in (text or "").splitlines()]
-    context_year: Optional[int] = None
-    current_section: Optional[str] = None
-    
-    for line in lines[:20]:
-        year_match = re.search(r'(\d{4})', line)
-        if year_match:
-            year = int(year_match.group(1))
-            if 2020 <= year <= 2030:
-                context_year = year
-                break
-                
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-        if not line:
-            continue
-        low = line.lower()
-        if 'total de entradas' in low or ('entradas' in low and 'total' in low):
-            current_section = "E"
-            continue
-        if 'total de saídas' in low or 'total de saidas' in low or ('saídas' in low and 'total' in low):
-            current_section = "S"
-            continue
-        if line.upper().startswith(('DATA', 'LANÇAMENTO', 'VALOR', 'SALDO', 'PERÍODO')):
-            continue
-        if 'saldo' in low and 'inicial' in low:
-            continue
-        if 'saldo' in low and 'final' in low:
-            continue
-            
-        # CORREÇÃO: Normalização leve para OCR (O -> 0, l -> 1 em contextos numéricos)
-        norm_line = re.sub(r'(?<=\d)O(?=\d)', '0', line)
-        norm_line = re.sub(r'(?<=\d)l(?=\d)', '1', norm_line)
-        
-        # CORREÇÃO: Usar re.search em vez de re.match para tolerar ruído de OCR no início da linha
-        date_match = re.search(r'(\d{2}/\d{2}/\d{4})', norm_line)
-        if not date_match:
-            # Tenta formato curto se o ano estiver no contexto
-            short_match = re.search(r'(\d{2}/\d{2})\b', norm_line)
-            if short_match and context_year:
-                date_str = short_match.group(1)
-                try:
-                    parsed_date = date_parser.parse(f"{date_str}/{context_year}", dayfirst=True).date()
-                except ValueError:
-                    continue
-            else:
-                continue
-        else:
-            date_str = date_match.group(1)
-            try:
-                parsed_date = date_parser.parse(date_str, dayfirst=True).date()
-            except ValueError:
-                continue
-                
-        money_matches = re.findall(r'([-+]?\d{1,3}(?:\.\d{3})*,\d{2})', norm_line)
-        if not money_matches:
-            continue
-            
-        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
-        amount_str = money_matches[0]
-        
-        amount = parse_money_value(amount_str)
-        is_credit = None
-        if amount_str.startswith('+'):
-            is_credit = True
-        elif amount_str.startswith('-'):
-            is_credit = False
-        elif current_section == "E":
-            is_credit = True
-        elif current_section == "S":
-            is_credit = False
-            
-        # Extração robusta da descrição: tudo entre a data e o valor
-        date_idx = norm_line.find(date_str)
-        amount_idx = norm_line.find(amount_str)
-        
-        if date_idx >= 0 and amount_idx >= 0 and amount_idx > date_idx:
-            description = norm_line[date_idx + len(date_str):amount_idx].strip()
-        else:
-            description = norm_line.replace(date_str, "", 1).replace(amount_str, "", 1).strip()
-            
-        # Limpeza final da descrição
-        description = re.sub(r'\s+', ' ', description).strip(" -–|*")
-        if not description:
-            description = "Lançamento não identificado"
-            
-        needs_review = is_credit is None
-        if is_credit is True and amount < 0:
-            amount = -amount
-            
-        transactions.append(Transaction(
-            date=parsed_date,
-            description=description,
-            amount=amount,
-            is_credit=is_credit,
-            bank=bank,
-            source_file=source_file,
-            needs_review=needs_review,
-        ))
-    return transactions
 
 # ---------------------------------------------------------------------------
 # Parser Caixa Econômica Federal (específico)

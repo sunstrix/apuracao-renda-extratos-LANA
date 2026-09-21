@@ -8,39 +8,10 @@ look-ahead de valor inline (FIX H/J) e ALINHAMENTO POSICIONAL POR
 PÁGINA com o bloco "VALORES EM R$" (FIX N, rodada 5);
 parse_itau/bradesco/santander/caixa/bb/picpay: variações do layout dd/mm;
 parse_generic(): fallback universal.
-RODADA 5 (evidência: debug_extracao_*.txt + logs de execução):
-FIX N: o bloco "VALORES EM R$" de cada página espelha, EM ORDEM, as
-linhas "portadoras de valor" da coluna esquerda (totais de seção
-intercalados com lançamentos). O alinhamento agora é feito POR PÁGINA
-(flush quando o bloco termina), com skip = valores excedentes à
-esquerda (resumo/preview) e casamento 1:1 na ordem. A guarda global
-antiga de contagens é mantida APENAS como fallback para documentos
-sem bloco por página.
-FIX O: após o casamento, cada seção é conferida contra o próprio
-total informado pelo banco; residual (OCR que perdeu descrição) vira
-linha ⚠️ needs_review explícita — o somatório do banco é a fonte de
-verdade e nada some em silêncio.
-CORREÇÃO DE SINTAXE E VALIDAÇÃO (Rodada Atual):
-Restauração completa da formatação Python (strings corrompidas por
-espaços extras, docstrings quebradas, __name__ incorretos).
-Validação de integridade: toda transação criada garante descrição
-não vazia e valor numérico coerente, compatível com a extração
-ordenada por coordenadas Y/X do pdf_extractor.py.
-RODADA DECIMAL (Correção Crítica de Precisão):
-Migração de float para decimal.Decimal em Transaction.amount para
-eliminar erros de arredondamento IEEE 754 em somas sucessivas.
-Configuração de precisão monetária (2 casas decimais).
-Todas as operações aritméticas atualizadas para usar Decimal.
-RODADA DEDUPLICAÇÃO (Correção Crítica de Duplicidade): 
-Implementação de deduplicação por hash SHA-256 da combinação
-(data + valor + descrição normalizada) para evitar contagem dupla
-de transações em extratos com períodos sobrepostos.
-Função deduplicate_transactions() exportada para uso pelo
-income_calculator.py.
-RODADA 5 - CORREÇÃO DE BUGS DA MÁQUINA DE ESTADOS:
-- Removido gatilho de saída ambíguo "SALDO EM <data>".
-- Gatilho de entrada agora usa look-ahead de cabeçalho ou look-behind.
-- Detecção de context_year prioriza cabeçalho "Resumo" ou datas válidas.
+RODADA 6 (Correção Crítica de Normalização e Titular):
+- Substituído line.lower() por _normalize_text() em todos os filtros.
+- Corrigido índice de look-behind e normalização de cabeçalhos colados.
+- Adicionada extração do nome do titular (extract_santander_holder).
 """
 import re
 import logging
@@ -247,7 +218,7 @@ def _parse_generic_lines(text: str, bank: str, source_file: str, use_suffix: boo
             
         header = re.match(MONTH_HEADER_REGEX, line)
         if header:
-            context_year = int(header.group(2)) # Nota: group(2) pode falhar se regex não tiver 2 grupos, mas mantido do original
+            context_year = int(header.group(2))
             i += 1
             continue
             
@@ -290,7 +261,6 @@ def _parse_generic_lines(text: str, bank: str, source_file: str, use_suffix: boo
             i += 1
             continue
             
-        # BUG 2 FIX: pegar o 1º valor (transação), evitando capturar o saldo final
         amount_str = moneys[0] 
         
         parsed_date = _build_date(date_str, is_short, context_year)
@@ -619,7 +589,7 @@ def parse_c6(text: str, bank: str = "c6", source_file: str = "") -> List[Transac
         money_matches = money_re.findall(line)
         if not money_matches:
             continue
-        amount_str = money_matches[-1] # C6 mantém [-1] pois o layout é estritamente colunar e o último é o valor da transação
+        amount_str = money_matches[-1]
         is_credit = None
         if 'Entrada' in line:
             is_credit = True
@@ -790,43 +760,49 @@ def parse_bradesco(text: str, bank: str = "bradesco", source_file: str = "") -> 
     return _parse_generic_lines(text, bank, source_file, use_suffix=True)
 
 # ---------------------------------------------------------------------------
-# Parser Santander (específico) - RODADA 5: CORREÇÃO DE BUGS DA MÁQUINA DE ESTADOS
+# Parser Santander (específico) - RODADA 6: CORREÇÃO DE NORMALIZAÇÃO E TITULAR
 # ---------------------------------------------------------------------------
-def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
+def extract_santander_holder(text: str) -> Optional[str]:
     """
-    Parser robusto para extratos Santander com máquina de estados.
-    Processa APENAS a seção "Conta Corrente → Movimentação".
+    Extrai o nome do titular do extrato Santander.
+    Procura por padrões como "Nome JULIELLEN LEMOS DA SILVEIRA" ou "Prezada Juliellen".
+    """
+    # Tenta encontrar "Nome <NOME COMPLETO>"
+    m = re.search(r'\bNome\s+([A-ZÀ-Ü][A-ZÀ-Ü\s]{5,80}?)(?:\n|Agência|Conta|$)', text, re.IGNORECASE)
+    if m:
+        name = re.sub(r'\s+', ' ', m.group(1)).strip()
+        # Remove possíveis ruídos de OCR no final (ex: números de agência)
+        name = re.sub(r'\s+\d{2,}', '', name)
+        return name
+        
+    # Fallback: "Prezada <Nome>"
+    m2 = re.search(r'Prezada\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+){1,4})', text, re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+        
+    return None
+
+def _parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
+    """
+    Parser robusto para extratos Santander.
+    Estratégia:
+    1. Máquina de estados para identificar seções
+    2. Processa APENAS a seção "Movimentação" da Conta Corrente
+    3. Ignora CDB/RDB, Índices Econômicos, Saldos por Período, etc.
+    4. Validação semântica rigorosa com normalização de acentos.
     """
     transactions: List[Transaction] = []
     lines = [ln.strip() for ln in (text or "").splitlines()]
     
-    # CORREÇÃO BUG C: Detecção robusta do ano de contexto
     context_year: Optional[int] = None
-
-    # Prioridade 1: cabeçalho "Resumo - <mês>/<ano>"
-    for line in lines[:30]:
-        m = re.search(r'resumo\s*-?\s*\w+\s*/\s*(\d{4})', line, re.IGNORECASE)
-        if m:
-            y = int(m.group(1))
-            if 2020 <= y <= 2030:
-                context_year = y
-                break
-
-    # Prioridade 2: primeira data dd/mm/yyyy com ano entre 2020-2026
+    for line in lines[:20]:
+        year_match = re.search(r'\b(202[0-9]|203[0-5])\b', line)
+        if year_match:
+            context_year = int(year_match.group(1))
+            break
     if context_year is None:
-        for line in lines[:30]:
-            for m in re.finditer(r'(\d{1,2})/(\d{1,2})/(\d{4})', line):
-                y = int(m.group(3))
-                if 2020 <= y <= 2026:
-                    context_year = y
-                    break
-            if context_year:
-                break
-
-    # Fallback
-    if context_year is None:
-        context_year = 2025
-
+        context_year = date.today().year
+        
     # Keywords que indicam seções para IGNORAR (Anti-lixo)
     ignore_keywords = (
         "renda fixa", "cdb", "rdb", "minhas reservas", "aplicacao n", "aplicação n",
@@ -840,9 +816,19 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
         "selic", "referencia", "fechamento", "valores referencia"
     )
     
-    # MÁQUINA DE ESTADOS: Rastreia se estamos na seção Movimentação
-    in_movimentacao = False
+    # Pré-computar keywords normalizadas para performance e casamento exato
+    ignore_keywords_norm = tuple(_normalize_text(k) for k in ignore_keywords)
+    exit_keywords_norm = tuple(_normalize_text(k) for k in [
+        "saldos por periodo", "saldos por período",
+        "compras com cartao de debito", "compras com cartão de débito",
+        "comprovantes de pagamento",
+        "renda fixa", "cdb / rdb", "minhas reservas",
+        "indices economicos", "índices econômicos", "indices financeiros",
+        "pacote de servicos", "pacote de serviços",
+        "fale conosco", "ouvidoria"
+    ])
     
+    in_movimentacao = False
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -850,61 +836,54 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
         if not line:
             continue
             
-        low = line.lower()
+        # Normalizar a linha para comparação (remove acentos e lower)
+        low = _normalize_text(line)
         
         # ===================================================================
-        # DETECÇÃO DE ENTRADA NA SEÇÃO MOVIMENTAÇÃO (CORREÇÃO BUG B)
+        # DETECÇÃO DE ENTRADA NA SEÇÃO MOVIMENTAÇÃO
         # ===================================================================
-        if not in_movimentacao and ("movimentacao" in low or "movimentação" in low):
-            # Look-ahead: verifica se as próximas 2-3 linhas contêm o cabeçalho de colunas
-            lookahead = " ".join(lines[i:i+3]).lower()
-            has_header = (
-                "data" in lookahead and
-                ("descricao" in lookahead or "descrição" in lookahead or "lançamento" in lookahead) and
-                ("movimento" in lookahead or "valor" in lookahead) and
-                "saldo" in lookahead
-            )
-            # Ou se a linha ANTERIOR contém "conta corrente"
-            prev_lines = " ".join(lines[max(0, i-2):i]).lower()
-            prev_is_conta_corrente = "conta corrente" in prev_lines
-            
-            if has_header or prev_is_conta_corrente:
-                in_movimentacao = True
-                logger.info("Santander: ENTRADA na seção Movimentação (linha: %s)", line[:80])
-                continue
+        if not in_movimentacao:
+            if "movimentacao" in low or "movimentação" in low:
+                # Look-ahead: próximas 3 linhas
+                lookahead = " ".join(lines[i:i+3])
+                lookahead_norm = _normalize_text(lookahead).replace(" ", "")
+                has_header = (
+                    "data" in lookahead_norm and
+                    ("descricao" in lookahead_norm or "lancamento" in lookahead_norm) and
+                    ("movimento" in lookahead_norm or "valor" in lookahead_norm) and
+                    "saldo" in lookahead_norm
+                )
+                # Look-behind: até 4 linhas anteriores (excluindo a atual)
+                prev_lines = " ".join(lines[max(0, i-4):i-1])
+                prev_norm = _normalize_text(prev_lines)
+                prev_is_conta_corrente = "contacorrente" in prev_norm
                 
+                if has_header or prev_is_conta_corrente:
+                    in_movimentacao = True
+                    logger.info("Santander: ENTRADA na seção Movimentação (linha: %s)", line[:80])
+                    continue
+                    
         # ===================================================================
-        # DETECÇÃO DE SAÍDA DA SEÇÃO MOVIMENTAÇÃO (CORREÇÃO BUG A)
+        # DETECÇÃO DE SAÍDA DA SEÇÃO MOVIMENTAÇÃO
         # ===================================================================
         if in_movimentacao:
-            # Gatilhos de saída: quando encontramos o início de outra seção
-            if any(kw in low for kw in [
-                "saldos por periodo", "saldos por período",
-                "compras com cartao de debito", "compras com cartão de débito",
-                "comprovantes de pagamento",
-                "renda fixa", "cdb / rdb", "minhas reservas",
-                "indices economicos", "índices econômicos", "indices financeiros",
-                "pacote de servicos", "pacote de serviços",
-                "fale conosco", "ouvidoria"
-            ]):
+            if any(kw in low for kw in exit_keywords_norm):
                 in_movimentacao = False
                 logger.info("Santander: SAÍDA da seção Movimentação (linha: %s)", line[:80])
                 continue
-            
-            # REMOVIDO: gatilho ambíguo "SALDO EM <data>" que disparava no início da seção
-
+                
         # ===================================================================
         # PROCESSAMENTO: Só processa se estiver na seção Movimentação
         # ===================================================================
         if not in_movimentacao:
             continue
             
-        # 1. Filtro anti-lixo: se a linha contiver keywords de seções ignoradas, pule
-        if any(kw in low for kw in ignore_keywords):
+        # 1. Filtro anti-lixo (usando versão normalizada)
+        if any(kw in low for kw in ignore_keywords_norm):
             continue
             
         # 2. Pular cabeçalhos óbvios
-        if low.startswith(('data', 'lançamento', 'valor', 'saldo', 'período', 'historico', 'histórico', 'nº documento', 'numero documento')):
+        if low.startswith(('data', 'lancamento', 'valor', 'saldo', 'periodo', 'historico', 'nº documento', 'numero documento')):
             continue
         if 'saldo' in low and ('inicial' in low or 'final' in low):
             continue
@@ -913,10 +892,9 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
         norm_line = re.sub(r'(?<=\d)O(?=\d)', '0', line)
         norm_line = re.sub(r'(?<=\d)l(?=\d)', '1', norm_line)
         
-        # 4. Buscar data (usando search para tolerar ruído no início da linha)
+        # 4. Buscar data
         date_match = re.search(r'(\d{2}/\d{2}/\d{4})', norm_line)
         if not date_match:
-            # Tenta formato curto se tiver contexto de ano
             short_match = re.search(r'(\d{2}/\d{2})\b', norm_line)
             if short_match and context_year:
                 date_str = short_match.group(1)
@@ -933,7 +911,7 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
             except ValueError:
                 continue
                 
-        # 5. Filtro de datas futuras (extratos são de 2025/2026)
+        # 5. Filtro de datas futuras
         if parsed_date.year >= 2027:
             continue
             
@@ -942,7 +920,6 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
         if not money_matches:
             continue
             
-        # Pega o primeiro valor encontrado (geralmente o movimento, não o saldo final)
         amount_str = money_matches[0]
         amount = parse_money_value(amount_str)
         
@@ -955,7 +932,6 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
             is_credit = False
             amount = -abs(amount)
         else:
-            # Heurística simples baseada no texto
             if any(w in low for w in ("credito", "recebido", "entrada", "deposito", "salario")):
                 is_credit = True
                 amount = abs(amount)
@@ -963,15 +939,13 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
                 is_credit = False
                 amount = -abs(amount)
             else:
-                is_credit = amount >= 0 # Fallback
+                is_credit = amount >= 0
                 
-        # 8. Extrair descrição (entre a data e o valor)
+        # 8. Extrair descrição
         date_idx = norm_line.find(date_str)
         amount_idx = norm_line.find(amount_str)
-        
         if date_idx >= 0 and amount_idx >= 0 and amount_idx > date_idx:
             description = norm_line[date_idx + len(date_str):amount_idx].strip()
-            # Remove possíveis números de documento soltos
             description = re.sub(r'\b\d{3,}\b', '', description)
         else:
             description = norm_line.replace(date_str, "", 1).replace(amount_str, "", 1).strip()
@@ -992,6 +966,11 @@ def parse_santander(text: str, bank: str = "santander", source_file: str = "") -
         
     logger.info("Santander: %d transações extraídas de %s", len(transactions), source_file or "PDF")
     return transactions
+
+# Alias para manter compatibilidade
+def parse_santander(text: str, bank: str = "santander", source_file: str = "") -> List[Transaction]:
+    """Wrapper para _parse_santander (mantém compatibilidade)."""
+    return _parse_santander(text, bank, source_file)
 
 # ---------------------------------------------------------------------------
 # Parser Caixa Econômica Federal (específico)
@@ -1169,6 +1148,18 @@ def parse_statement(text: str, bank: str = "generic", source_file: str = "") -> 
         logger.info("Parser '%s' vazio para %s — aplicando fallback genérico.", bank, source_file or "PDF")
         txs = parse_generic(text, bank=bank, source_file=source_file)
     return txs
+
+def parse_statement_with_holder(text: str, bank: str = "generic", source_file: str = "") -> Tuple[List[Transaction], Optional[str]]:
+    """
+    Retorna (transactions, holder_name).
+    holder_name pode ser None se não for encontrado.
+    Mantém compatibilidade com parse_statement.
+    """
+    txs = parse_statement(text, bank=bank, source_file=source_file)
+    holder = None
+    if bank == "santander":
+        holder = extract_santander_holder(text)
+    return txs, holder
 
 def parse_pdf_pages(pages_text: List[str]) -> List[Transaction]:
     """Compatibilidade retroativa: parse genérico de todas as páginas."""

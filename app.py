@@ -28,7 +28,7 @@ BUG 3 FIX: try/except explícito na geração do PDF + brl() reescrito para
 suportar Decimal nativamente (sem perda de precisão).
 Bug crítico da deduplicação: movida de calculate_income_metrics() para
 app.py, ANTES da revisão manual. Assim os índices da tabela de revisão
-correspondem aos índices reais da lista de duplicada, evitando que
+correspondem aos índices reais da lista deduplicada, evitando que
 decisões do operador recaiam sobre transações erradas.
 Regressão regex: HOLDER_EXCLUSION_KEYWORDS revertido de 'NUs' para 'NU\s'
 (espaço após NU), restaurando filtro correto contra "NU PAGAMENTOS S.A.".
@@ -44,7 +44,7 @@ import re
 import streamlit as st
 import pandas as pd
 from decimal import Decimal, InvalidOperation
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from src.pdf_extractor import extract_text_from_pdf
 from src.bank_detector import detect_bank, bank_display_name
 from src.transaction_parser import parse_statement, parse_statement_with_holder, deduplicate_transactions
@@ -56,7 +56,8 @@ from src.gemini_extractor import (
     gemini_available,
 )
 
-logging.basicConfig(level=logging.INFO)
+# CORREÇÃO: Adicionado encoding="utf-8" para evitar corrupção de caracteres (ex: "extra玢o") no console do Windows
+logging.basicConfig(level=logging.INFO, encoding="utf-8")
 logger = logging.getLogger(__name__)
 
 st.set_page_config(
@@ -364,7 +365,8 @@ def main():
                 for future in as_completed(future_to_file):
                     uf = future_to_file[future]
                     try:
-                        (file_name, success, txs, bank, holder, error, info_gemini) = future.result()
+                        # CORREÇÃO: Adicionado timeout de 10 minutos (600s) para evitar travamento infinito
+                        (file_name, success, txs, bank, holder, error, info_gemini) = future.result(timeout=600)
                         completed_count += 1
                         if info_gemini.get("used"):
                             gemini_used_any = True
@@ -374,13 +376,20 @@ def main():
                             institutions.add(bank_display_name(bank))
                             if not detected_holder and holder:
                                 detected_holder = holder
-                            # CORREÇÃO: Emoji removido de f-string
-                            selo = "\U0001F916" if info_gemini.get("used") else "\u2705"  # 🤖 ou ✅
+                            selo = "\U0001F916" if info_gemini.get("used") else "\u2705"
                             status.write(f"{selo} {file_name}: {len(txs)} transações ({bank_display_name(bank)})")
                         else:
                             failed_files.append((file_name, error))
-                            # CORREÇÃO: Emoji removido de f-string
-                            status.write(f"\u26A0\uFE0F {file_name}: {error}")  # ⚠️
+                            status.write(f"\u26A0\uFE0F {file_name}: {error}")
+                        progress.progress(
+                            completed_count / total,
+                            text=f"Processado {completed_count}/{total} arquivos"
+                        )
+                    except TimeoutError as te:
+                        completed_count += 1
+                        logger.error("Timeout ao processar %s: %s", uf.name, te)
+                        failed_files.append((uf.name, "Timeout: o processamento excedeu 10 minutos."))
+                        status.write(f"\u26A0\uFE0F {uf.name}: Timeout (excedeu 10 minutos)")
                         progress.progress(
                             completed_count / total,
                             text=f"Processado {completed_count}/{total} arquivos"
@@ -389,8 +398,7 @@ def main():
                         completed_count += 1
                         logger.error("Erro inesperado ao processar %s: %s", uf.name, e)
                         failed_files.append((uf.name, str(e)))
-                        # CORREÇÃO: Emoji removido de f-string
-                        status.write(f"\u26A0\uFE0F {uf.name}: {e}")  # ⚠️
+                        status.write(f"\u26A0\uFE0F {uf.name}: {e}")
                         progress.progress(
                             completed_count / total,
                             text=f"Processado {completed_count}/{total} arquivos"
@@ -399,9 +407,6 @@ def main():
             status.update(label="Processamento concluído!", state="complete")
             
         # CORREÇÃO CRÍTICA: Deduplicação ANTES da revisão manual
-        # Assim os índices da tabela de revisão correspondem aos índices reais
-        # da lista deduplicada, evitando que decisões do operador recaiam
-        # sobre transações erradas.
         raw_all, duplicates_removed = deduplicate_transactions(raw_all)
         if duplicates_removed > 0:
             logger.info(
@@ -409,11 +414,10 @@ def main():
                 duplicates_removed
             )
             
-        # Toast de sucesso/erro
         if raw_all:
-            st.toast(f"\u2705 {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="\u2705")  # ✅
+            st.toast(f"\u2705 {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="\u2705")
         if failed_files:
-            st.toast(f"\u26A0\uFE0F {len(failed_files)} arquivo(s) com erro", icon="\u26A0\uFE0F")  # ⚠️
+            st.toast(f"\u26A0\uFE0F {len(failed_files)} arquivo(s) com erro", icon="\u26A0\uFE0F")
             
         if gemini_used_any and gemini_mismatches:
             st.warning(
@@ -479,7 +483,6 @@ def main():
     if "review_df" not in st.session_state:
         st.session_state.review_df = build_review_dataframe(raw)
         
-    # Resumo acima da tabela (contagens por categoria)
     df_preview = st.session_state.review_df
     n_credit = int((df_preview["Sinal"] == "Crédito").sum())
     n_debit = int((df_preview["Sinal"] == "Débito").sum())
@@ -547,7 +550,6 @@ def main():
         key="review_editor",
     )
     
-    # Aviso de pendentes
     pendentes = int(
         ((edited["Sinal"].astype(str) == "Indeterminado")
          & (~edited["Incluir na apuração"])).sum()
@@ -595,13 +597,12 @@ def main():
         st.divider()
         st.subheader("Prévia dos Resultados")
         
-        # Rastreabilidade IA e revisão
         n_gemini = sum(1 for t in raw if getattr(t, "extraction_source", "") == "gemini")
         revisao = metrics.get("revisao_manual", {})
         if n_gemini or revisao:
             info_parts = []
             if n_gemini:
-                info_parts.append(f"\U0001F916 {n_gemini} lançamento(s) via IA (Gemini)")  # 🤖
+                info_parts.append(f"\U0001F916 {n_gemini} lançamento(s) via IA (Gemini)")
             if revisao:
                 info_parts.append(
                     f"Revisão: {len(revisao.get('incluidas', []))} confirmado(s) • "
@@ -609,7 +610,6 @@ def main():
                 )
             st.caption(" • ".join(info_parts))
             
-        # BUG 1 FIX: KPI Cards usando st.metric nativo (estilizado via CSS)
         col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
         with col_kpi1:
             st.metric(
@@ -630,7 +630,6 @@ def main():
                 help="Total / meses com >20 dias cobertos",
             )
             
-        # Tabs para organizar resultados
         tab_resumo, tab_validas, tab_auditoria, tab_export = st.tabs([
             "Resumo por Mês",
             "Entradas Válidas",
@@ -672,7 +671,6 @@ def main():
             col_pdf, col_xlsx, col_csv = st.columns(3)
             
             with col_pdf:
-                # BUG 3 FIX: try/except explícito na geração do PDF
                 try:
                     with st.spinner("Gerando PDF..."):
                         pdf_buffer = generate_report(metrics, holder_name, institutions)
@@ -719,7 +717,6 @@ def main():
                     logger.error("Erro ao gerar CSV: %s", e, exc_info=True)
                     st.error(f"Erro ao gerar CSV: {str(e)}")
                     
-    # Footer (mantido com autoria)
     render_footer()
 
 if __name__ == "__main__":

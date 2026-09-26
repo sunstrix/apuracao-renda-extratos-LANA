@@ -28,7 +28,7 @@ BUG 3 FIX: try/except explícito na geração do PDF + brl() reescrito para
 suportar Decimal nativamente (sem perda de precisão).
 Bug crítico da deduplicação: movida de calculate_income_metrics() para
 app.py, ANTES da revisão manual. Assim os índices da tabela de revisão
-correspondem aos índices reais da lista deduplicada, evitando que
+correspondem aos índices reais da lista de duplicada, evitando que
 decisões do operador recaiam sobre transações erradas.
 Regressão regex: HOLDER_EXCLUSION_KEYWORDS revertido de 'NUs' para 'NU\s'
 (espaço após NU), restaurando filtro correto contra "NU PAGAMENTOS S.A.".
@@ -47,7 +47,7 @@ from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.pdf_extractor import extract_text_from_pdf
 from src.bank_detector import detect_bank, bank_display_name
-from src.transaction_parser import parse_statement, deduplicate_transactions
+from src.transaction_parser import parse_statement, parse_statement_with_holder, deduplicate_transactions
 from src.income_calculator import calculate_income_metrics
 from src.report_generator import generate_report, generate_excel, generate_csv
 from src.gemini_extractor import (
@@ -101,7 +101,6 @@ def brl(value) -> str:
             v = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         v = Decimal('0.00')
-    
     # Formata com 2 casas decimais e separadores pt-BR
     formatted = f"{v:,.2f}"
     return f"R$ {formatted}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -115,7 +114,6 @@ def try_detect_holder_name(text_pages) -> str:
     lines = []
     for page in (text_pages or [])[:2]:
         lines.extend((page or "").splitlines())
-    
     for idx, line in enumerate(lines):
         if "CPF" not in line:
             continue
@@ -156,7 +154,6 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 bank = detect_bank(full_text_preview)
             except Exception:
                 bank = "generic"
-            
             txs, data, mismatches = extract_transactions_via_gemini(
                 pdf_bytes, uploaded_file.name, bank
             )
@@ -165,7 +162,6 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 info_gemini["used"] = True
                 info_gemini["mismatches"] = mismatches
                 return (uploaded_file.name, True, txs, bank, holder, None, info_gemini)
-            
             logger.warning(
                 "Gemini retornou 0 transações para %s; usando fallback local.",
                 uploaded_file.name,
@@ -175,7 +171,7 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
                 "Gemini indisponível/erro em %s (%s); usando fallback local.",
                 uploaded_file.name, ge,
             )
-    
+            
     # --- Caminho 2: pipeline local determinístico (fallback garantido) ---
     try:
         uploaded_file.seek(0)
@@ -184,11 +180,17 @@ def _process_single_pdf(uploaded_file, use_gemini: bool = False):
             return (uploaded_file.name, False, [], None, None,
                     "Arquivo não pôde ser lido (protegido por senha, corrompido ou sem camada de texto)",
                     info_gemini)
-        
         full_text = "\n".join(pages)
         bank = detect_bank(full_text)
-        detected_holder = try_detect_holder_name(pages)
-        txs = parse_statement(full_text, bank=bank, source_file=uploaded_file.name)
+        
+        # CORREÇÃO CRÍTICA: Usa parse_statement_with_holder para capturar o titular 
+        # específico do banco (ex: extract_santander_holder para Santander)
+        txs, detected_holder = parse_statement_with_holder(full_text, bank=bank, source_file=uploaded_file.name)
+        
+        # Fallback para detecção genérica (ex: Nubank/OCR) caso o parser específico não encontre
+        if not detected_holder:
+            detected_holder = try_detect_holder_name(pages)
+            
         return (uploaded_file.name, True, txs, bank, detected_holder, None, info_gemini)
     except Exception as e:
         logger.error("Erro ao processar %s: %s", uploaded_file.name, e)
@@ -207,7 +209,6 @@ def build_review_dataframe(raw) -> pd.DataFrame:
             sinal, incluir, status = "Crédito", True, "Automático"
         else:
             sinal, incluir, status = "Débito", False, "Automático (fora da renda)"
-        
         rows.append({
             "ID": idx,
             "Data": t.date.strftime("%d/%m/%Y"),
@@ -228,7 +229,6 @@ def render_hero_section(gemini_ok: bool) -> None:
     badge_class = "badge-success" if gemini_ok else "badge-info"
     badge_text = "Gemini Ativo" if gemini_ok else "Modo Local"
     badge_dot = '<span class="badge-dot"></span>' if gemini_ok else ""
-    
     st.markdown(
         f"""
         <div class="app-header">
@@ -266,7 +266,7 @@ def render_footer() -> None:
                 <div class="app-footer-links">
                     <a href="https://github.com/sunstrix/apuracao-renda-extratos-LANA" target="_blank" rel="noopener noreferrer" aria-label="Repositório no GitHub">
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.8 4 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                            <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
                         </svg>
                         GitHub
                     </a>
@@ -317,7 +317,7 @@ def main():
         use_gemini = use_gemini_cfg and consent_gemini
         if not gemini_ok:
             st.caption("Gemini: chave não configurada (.env). Fluxo local ativo.")
-
+            
     for key, default in (("raw_transactions", None), ("metrics", None),
                          ("detected_holder", ""), ("institutions", None),
                          ("reviewed", False),
@@ -325,19 +325,20 @@ def main():
                          ("duplicates_removed", 0)):
         if key not in st.session_state:
             st.session_state[key] = default
-
+            
     uploaded_files = st.file_uploader(
         "Selecione os arquivos PDF dos extratos",
         type=["pdf"],
         accept_multiple_files=True,
         help="Aceita múltiplos PDFs de qualquer banco brasileiro. Extratos com períodos sobrepostos serão automaticamente deduplicados.",
     )
+    
     holder_input = st.text_input(
         "Nome do Titular (opcional - será tentada a auto-detecção)",
         value=st.session_state.detected_holder or "",
         help="Informe o nome completo do titular das contas. Se deixado em branco, o sistema tentará detectá-lo automaticamente no extrato.",
     )
-
+    
     # ------------------------------------------------------------------ #
     # Etapa 1: extração + parsing (com status/progresso e PARALELIZAÇÃO)
     # ------------------------------------------------------------------ #
@@ -365,24 +366,21 @@ def main():
                     try:
                         (file_name, success, txs, bank, holder, error, info_gemini) = future.result()
                         completed_count += 1
-                        
                         if info_gemini.get("used"):
                             gemini_used_any = True
                             gemini_mismatches.extend(info_gemini.get("mismatches", []))
-                        
                         if success:
                             raw_all.extend(txs)
                             institutions.add(bank_display_name(bank))
                             if not detected_holder and holder:
                                 detected_holder = holder
                             # CORREÇÃO: Emoji removido de f-string
-                            selo = "\U0001F916 " if info_gemini.get("used") else "\u2705 "  # 🤖 ou ✅
-                            status.write(f"{selo}{file_name}: {len(txs)} transações ({bank_display_name(bank)})")
+                            selo = "\U0001F916" if info_gemini.get("used") else "\u2705"  # 🤖 ou ✅
+                            status.write(f"{selo} {file_name}: {len(txs)} transações ({bank_display_name(bank)})")
                         else:
                             failed_files.append((file_name, error))
                             # CORREÇÃO: Emoji removido de f-string
                             status.write(f"\u26A0\uFE0F {file_name}: {error}")  # ⚠️
-                        
                         progress.progress(
                             completed_count / total,
                             text=f"Processado {completed_count}/{total} arquivos"
@@ -397,10 +395,9 @@ def main():
                             completed_count / total,
                             text=f"Processado {completed_count}/{total} arquivos"
                         )
-            
             progress.progress(1.0, text="Processamento concluído!")
             status.update(label="Processamento concluído!", state="complete")
-        
+            
         # CORREÇÃO CRÍTICA: Deduplicação ANTES da revisão manual
         # Assim os índices da tabela de revisão correspondem aos índices reais
         # da lista deduplicada, evitando que decisões do operador recaiam
@@ -411,19 +408,19 @@ def main():
                 "Deduplicação: %d transação(ões) duplicada(s) removida(s) antes da revisão.",
                 duplicates_removed
             )
-        
+            
         # Toast de sucesso/erro
         if raw_all:
             st.toast(f"\u2705 {len(raw_all)} transações extraídas de {total - len(failed_files)} arquivo(s)", icon="\u2705")  # ✅
         if failed_files:
             st.toast(f"\u26A0\uFE0F {len(failed_files)} arquivo(s) com erro", icon="\u26A0\uFE0F")  # ⚠️
-        
+            
         if gemini_used_any and gemini_mismatches:
             st.warning(
                 f"\u26A0\uFE0F Gemini: {len(gemini_mismatches)} seção(ões) com somatório divergente "
                 "do total impresso pelo banco. Confira a tabela de auditoria antes de confirmar."
             )
-        
+            
         if failed_files:
             with st.expander(f"\u26A0\uFE0F {len(failed_files)} arquivo(s) com erro — clique para detalhes"):
                 for fname, err in failed_files:
@@ -433,7 +430,7 @@ def main():
                         key=f"retry_{fname}",
                         on_click=lambda f=fname: st.rerun(),
                     )
-        
+                    
         st.session_state.raw_transactions = raw_all
         st.session_state.institutions = institutions
         st.session_state.detected_holder = detected_holder or holder_input
@@ -442,7 +439,7 @@ def main():
         st.session_state.duplicates_removed = duplicates_removed
         if "review_df" in st.session_state:
             del st.session_state["review_df"]
-
+            
     raw = st.session_state.raw_transactions
     if raw is None:
         render_footer()
@@ -451,10 +448,10 @@ def main():
         st.error("Nenhuma transação pôde ser extraída dos arquivos fornecidos.")
         render_footer()
         return
-    
+        
     holder_name = holder_input or st.session_state.detected_holder or "Titular Não Identificado"
     institutions = list(st.session_state.institutions or [])
-
+    
     # ------------------------------------------------------------------ #
     # Etapa 2: transações brutas (antes das regras) para validação visual
     # ------------------------------------------------------------------ #
@@ -467,7 +464,7 @@ def main():
             "Arquivo": t.source_file or "-",
         } for t in raw])
         st.dataframe(df_raw, width="stretch", height=320)
-
+        
     # ------------------------------------------------------------------ #
     # Etapa 3: revisão manual obrigatória (st.data_editor melhorado)
     # ------------------------------------------------------------------ #
@@ -481,7 +478,7 @@ def main():
     
     if "review_df" not in st.session_state:
         st.session_state.review_df = build_review_dataframe(raw)
-    
+        
     # Resumo acima da tabela (contagens por categoria)
     df_preview = st.session_state.review_df
     n_credit = int((df_preview["Sinal"] == "Crédito").sum())
@@ -561,7 +558,7 @@ def main():
             "segurança, elas serão EXCLUÍDAS da apuração e listadas na auditoria. "
             "Marque 'Incluir na apuração' nas que forem renda efetiva."
         )
-
+        
     if st.button("Confirmar Revisão e Gerar Relatório", type="primary"):
         manual_inclusions = set()
         manual_exclusions = {}
@@ -578,7 +575,7 @@ def main():
             else:
                 if (t.is_credit or float(t.amount) > 0) and not incluir:
                     manual_exclusions[idx] = motivo or "Excluída manualmente pelo operador"
-        
+                    
         st.session_state.manual_inclusions = manual_inclusions
         st.session_state.manual_exclusions = manual_exclusions
         st.session_state.metrics = calculate_income_metrics(
@@ -589,7 +586,7 @@ def main():
         )
         st.session_state.reviewed = True
         st.success("Revisão confirmada. Relatório e exportações liberados abaixo.")
-
+        
     # ------------------------------------------------------------------ #
     # Etapa 4: resultados + exportações (em TABS para reduzir rolagem)
     # ------------------------------------------------------------------ #
@@ -601,7 +598,6 @@ def main():
         # Rastreabilidade IA e revisão
         n_gemini = sum(1 for t in raw if getattr(t, "extraction_source", "") == "gemini")
         revisao = metrics.get("revisao_manual", {})
-        
         if n_gemini or revisao:
             info_parts = []
             if n_gemini:
@@ -612,7 +608,7 @@ def main():
                     f"{len(revisao.get('excluidas', []))} exclusão(ões)"
                 )
             st.caption(" • ".join(info_parts))
-        
+            
         # BUG 1 FIX: KPI Cards usando st.metric nativo (estilizado via CSS)
         col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
         with col_kpi1:
@@ -633,7 +629,7 @@ def main():
                 value=brl(metrics["media_meses_completos"]),
                 help="Total / meses com >20 dias cobertos",
             )
-        
+            
         # Tabs para organizar resultados
         tab_resumo, tab_validas, tab_auditoria, tab_export = st.tabs([
             "Resumo por Mês",
@@ -649,7 +645,7 @@ def main():
                 st.dataframe(df_resumo, width="stretch")
             else:
                 st.info("Nenhum dado mensal consolidado disponível.")
-        
+                
         with tab_validas:
             if metrics["entradas_validas"]:
                 df_validas = pd.DataFrame([{
@@ -660,7 +656,7 @@ def main():
                 st.dataframe(df_validas, width="stretch")
             else:
                 st.info("Nenhuma entrada válida encontrada.")
-        
+                
         with tab_auditoria:
             if metrics["entradas_excluidas"]:
                 df_exc = pd.DataFrame(metrics["entradas_excluidas"])
@@ -669,12 +665,12 @@ def main():
                 st.dataframe(df_exc, width="stretch")
             else:
                 st.info("Nenhum valor excluído.")
-        
+                
         with tab_export:
             st.subheader("Relatório Executivo e Exportações")
             st.caption("Gere os relatórios em PDF, Excel ou CSV para download.")
-            
             col_pdf, col_xlsx, col_csv = st.columns(3)
+            
             with col_pdf:
                 # BUG 3 FIX: try/except explícito na geração do PDF
                 try:
@@ -692,7 +688,7 @@ def main():
                 except Exception as e:
                     logger.error("Erro ao gerar PDF: %s", e, exc_info=True)
                     st.error(f"Erro ao gerar PDF: {str(e)}")
-            
+                    
             with col_xlsx:
                 try:
                     with st.spinner("Gerando Excel..."):
@@ -707,7 +703,7 @@ def main():
                 except Exception as e:
                     logger.error("Erro ao gerar Excel: %s", e, exc_info=True)
                     st.error(f"Erro ao gerar Excel: {str(e)}")
-            
+                    
             with col_csv:
                 try:
                     with st.spinner("Gerando CSV..."):
@@ -722,7 +718,7 @@ def main():
                 except Exception as e:
                     logger.error("Erro ao gerar CSV: %s", e, exc_info=True)
                     st.error(f"Erro ao gerar CSV: {str(e)}")
-    
+                    
     # Footer (mantido com autoria)
     render_footer()
 

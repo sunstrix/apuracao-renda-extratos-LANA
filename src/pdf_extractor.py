@@ -1,19 +1,19 @@
 """
 Extração de texto de PDFs com fallback em camadas e otimizações de performance.
 Arquitetura:
-Detecção inteligente de texto vs imagem (evita OCR desnecessário)
-Prioridade: fitz (PyMuPDF) > pdfplumber > OCR
-Gate de legibilidade para detectar texto corrompido
-Cache com @st.cache_data para evitar reprocessamento
-DPI adaptativo para OCR (150 → 200 se qualidade baixa)
-A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
-e seleção de idioma via pytesseract.get_languages() quando o diretório
-não é resolvido por filesystem.
-A3: auto-download do por.traineddata (uma única vez) com cache em
-~/.cache/tessdata — elimina a dependência de instalação manual no Windows
-e iguala o OCR local ao do Cloud (lang='por').
-DEPRECATION PyMuPDF>=1.24: import via "pymupdf" (alias "fitz" mantido por
-compatibilidade com o pin >=1.23.0 do requirements.txt).
+- Detecção inteligente de texto vs imagem (evita OCR desnecessário)
+- Prioridade: fitz (PyMuPDF) > pdfplumber > OCR
+- Gate de legibilidade para detectar texto corrompido
+- Cache com @st.cache_data para evitar reprocessamento
+- DPI adaptativo para OCR (150 → 200 se qualidade baixa)
+- A2: resolução de tessdata cross-platform (Windows E Linux/Streamlit Cloud)
+  e seleção de idioma via pytesseract.get_languages() quando o diretório
+  não é resolvido por filesystem.
+- A3: auto-download do por.traineddata (uma única vez) com cache em
+  ~/.cache/tessdata — elimina a dependência de instalação manual no Windows
+  e iguala o OCR local ao do Cloud (lang='por').
+- DEPRECATION PyMuPDF >=1.24: import via "pymupdf" (alias "fitz" mantido por
+  compatibilidade com o pin >=1.23.0 do requirements.txt).
 """
 import io
 import os
@@ -23,8 +23,9 @@ import logging
 import platform
 import threading
 import unicodedata
-from typing import List, Dict, Any, Optional, Tuple
 import hashlib
+import concurrent.futures
+from typing import List, Dict, Any, Optional, Tuple
 
 import pdfplumber
 
@@ -47,7 +48,6 @@ except ImportError:
 
 # Configuração de logging para diagnóstico sem poluir a interface do Streamlit
 logger = logging.getLogger(__name__)
-
 DEBUG_DIR = "logs"
 
 # ---------------------------------------------------------------------------
@@ -81,14 +81,14 @@ VOWEL_RATIO_MAX = 0.55
 # impossíveis de surgir por acaso em texto embaralhado: este é o sinal
 # confiável de legibilidade.
 COMMON_PT_WORDS = {
-    "de ",  "da ",  "do ",  "das ",  "dos ",  "para ",  "por ",  "com ",  "sem ",  "nos ",  "nas ",
-    "conta ",  "valor ",  "valores ",  "data ",  "datas ",  "saldo ",  "banco ",
-    "pagamento ",  "pagamentos ",  "transferencia ",  "transferido ",  "recebido ",
-    "recebidos ",  "enviado ",  "enviados ",  "pix ",  "boleto ",  "boletos ",  "cartao ",
-    "compra ",  "compras ",  "debito ",  "credito ",  "extrato ",  "movimentacao ",
-    "movimentacoes ",  "titular ",  "agencia ",  "documento ",  "referente ",
-    "descricao ",  "lancamento ",  "lancamentos ",  "periodo ",  "historico ",
-    "disponivel ",  "total ",  "entrada ",  "entradas ",  "saida ",
+    "de ", "da ", "do ", "das ", "dos ", "para ", "por ", "com ", "sem ", "nos ", "nas ",
+    "conta ", "valor ", "valores ", "data ", "datas ", "saldo ", "banco ",
+    "pagamento ", "pagamentos ", "transferencia ", "transferido ", "recebido ",
+    "recebidos ", "enviado ", "enviados ", "pix ", "boleto ", "boletos ", "cartao ",
+    "compra ", "compras ", "debito ", "credito ", "extrato ", "movimentacao ",
+    "movimentacoes ", "titular ", "agencia ", "documento ", "referente ",
+    "descricao ", "lancamento ", "lancamentos ", "periodo ", "historico ",
+    "disponivel ", "total ", "entrada ", "entradas ", "saida ",
 }
 
 # Calibração conservadora (documentação do raciocínio):
@@ -114,6 +114,14 @@ MIN_TOKEN_LEN = 2
 
 # Caminho padrão do Tesseract no Windows (instalador UB-Mannheim via winget)
 TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ---------------------------------------------------------------------------
+# LIMITE DE PÁGINAS PARA OCR (NOVO)
+# ---------------------------------------------------------------------------
+# PDFs escaneados com centenas de páginas podem travar o sistema.
+# Este limite protege a aplicação, processando apenas o início do documento
+# via OCR e alertando o usuário para dividir o arquivo ou usar Gemini.
+MAX_OCR_PAGES = 50
 
 # ---------------------------------------------------------------------------
 # A2 — candidatos de tessdata no Linux (apt, compilação própria, contêineres)
@@ -152,7 +160,6 @@ TESSDATA_DOWNLOAD_URLS = {
 # Serializa o download entre chamadas concorrentes (ThreadPoolExecutor do app.py).
 _TESSDATA_LOCK = threading.Lock()
 
-
 # ---------------------------------------------------------------------------
 # EXTRAÇÃO ORDENADA POR COORDENADAS VISUAIS (CORREÇÃO CRÍTICA)
 # ---------------------------------------------------------------------------
@@ -183,7 +190,6 @@ def _extract_text_ordered_fitz(page) -> str:
         logger.warning(f"Falha na extração ordenada fitz, usando fallback: {e}")
         return page.get_text("text", sort=True)
 
-
 def _extract_text_ordered_pdfplumber(page) -> str:
     """
     Extrai texto do pdfplumber respeitando a ordem visual (top-to-bottom).
@@ -212,7 +218,6 @@ def _extract_text_ordered_pdfplumber(page) -> str:
     except Exception as e:
         logger.warning(f"Falha na extração ordenada pdfplumber, usando fallback: {e}")
         return page.extract_text() or ""
-
 
 def _dump_debug_text(source_name: str, pages_text: List[str], origin: str) -> None:
     """
@@ -636,45 +641,49 @@ def pdf_has_text(file_bytes: bytes) -> bool:
         # Em caso de erro, assume que pode ter texto (conservador)
         return True
 
-def _ocr_with_adaptive_dpi(page, lang: str = "por") -> str:
+def _ocr_with_adaptive_dpi(page, lang: str = "por", timeout: int = 30) -> str:
     """
-    PERF-4: OCR com DPI adaptativo.
-
+    PERF-4: OCR com DPI adaptativo e TIMEOUT.
     Tenta OCR com DPI 150 primeiro (mais rápido); se qualidade for baixa,
     reprocessa com DPI 200 (mais lento, mas confiável).
-
-    Args:
-        page: Página do PyMuPDF
-        lang: Idioma do OCR ('por' ou 'eng')
-
-    Returns:
-        Texto extraído via OCR
+    Inclui timeout para evitar travamento indefinido em páginas malformadas.
     """
     import pytesseract
 
-    # Tentativa 1: DPI baixo (mais rápido)
-    pix = page.get_pixmap(dpi=150)
-    image = Image.open(io.BytesIO(pix.tobytes("png")))
-    text = pytesseract.image_to_string(image, lang=lang)
-    image.close()
+    def _run_ocr(dpi: int) -> str:
+        pix = page.get_pixmap(dpi=dpi)
+        try:
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(image, lang=lang)
+            image.close()
+            return text
+        finally:
+            del pix
 
-    # Valida qualidade usando gate de legibilidade
-    hits, total = _real_word_stats(text)
-    if total >= MIN_ALPHA_TOKENS and (hits / total) >= (REAL_WORD_RATIO_MIN * 0.8):
-        logger.info(f"OCR com DPI 150 aceitável ({hits}/{total} palavras)")
-        del pix
-        return text
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            # Tentativa 1: DPI baixo
+            future = executor.submit(_run_ocr, 150)
+            text = future.result(timeout=timeout)
+            
+            # Valida qualidade usando gate de legibilidade
+            hits, total = _real_word_stats(text)
+            if total >= MIN_ALPHA_TOKENS and (hits / total) >= (REAL_WORD_RATIO_MIN * 0.8):
+                logger.info(f"OCR com DPI 150 aceitável ({hits}/{total} palavras)")
+                return text
 
-    # Tentativa 2: DPI alto (mais lento, mas confiável)
-    logger.info(f"OCR com DPI 150 insuficiente; retentando com DPI 200")
-    pix = page.get_pixmap(dpi=200)
-    image = Image.open(io.BytesIO(pix.tobytes("png")))
-    text = pytesseract.image_to_string(image, lang=lang)
-    image.close()
-    del pix
-    del image
+            # Tentativa 2: DPI alto
+            logger.info("OCR com DPI 150 insuficiente; retentando com DPI 200")
+            future2 = executor.submit(_run_ocr, 200)
+            text = future2.result(timeout=timeout)
+            return text
 
-    return text
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"Timeout no OCR da página (>{timeout}s). Retornando texto vazio para esta página.")
+        return ""
+    except Exception as e:
+        logger.warning(f"Erro no OCR da página: {e}. Retornando texto vazio.")
+        return ""
 
 def _compute_file_hash(file_bytes: bytes) -> str:
     """Computa hash SHA256 do conteúdo do arquivo para cache."""
@@ -758,11 +767,31 @@ def _extract_text_from_pdf_impl(file_bytes: bytes, source_name: str) -> List[str
     try:
         pages_text = []
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            for page_num in range(len(doc)):
+            total_pages = len(doc)
+            
+            # Limite de páginas para OCR para evitar travamento em PDFs gigantes escaneados
+            if total_pages > MAX_OCR_PAGES:
+                logger.warning(
+                    f"PDF com {total_pages} páginas excede o limite seguro de OCR ({MAX_OCR_PAGES}). "
+                    f"Processando apenas as primeiras {MAX_OCR_PAGES} páginas para evitar travamento."
+                )
+                pages_to_process = MAX_OCR_PAGES
+            else:
+                pages_to_process = total_pages
+
+            for page_num in range(pages_to_process):
+                logger.info(f"Processando OCR página {page_num + 1}/{pages_to_process}...")
                 page = doc.load_page(page_num)
-                # PERF-4: DPI adaptativo (150 primeiro, 200 se qualidade baixa)
+                # PERF-4: DPI adaptativo com timeout (150 primeiro, 200 se qualidade baixa)
                 text = _ocr_with_adaptive_dpi(page, lang=ocr_lang)
                 pages_text.append(text)
+                
+            if total_pages > MAX_OCR_PAGES:
+                pages_text.append(
+                    f"\n[AVISO: O arquivo possui {total_pages} páginas. O processamento via OCR "
+                    f"foi limitado a {MAX_OCR_PAGES} páginas para evitar travamento. "
+                    f"Considere usar a extração via Gemini ou dividir o arquivo.]"
+                )
 
         _dump_debug_text(source_name, pages_text, f"ocr_{ocr_lang}")
         logger.info(f"Extração bem-sucedida via OCR ({ocr_lang})")
